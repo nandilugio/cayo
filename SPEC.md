@@ -42,7 +42,7 @@ The machine is split into two principals, each a separate OS user:
 
 - **AI workspace** (untrusted): the agent **and all development tooling**, including the human's
   editor, LSP servers, tests, dev servers, package installs, git working copies and toolchains.
-  The human does their coding *inside* the AI workspace, over ssh. The OS user is `ws` in this
+  The human does their coding *inside* the AI workspace, over ssh. The OS user is `aiws` in this
   document.
 - **Privileged** (trusted): the human's own account. It holds the secrets (cloud credentials, ssh
   keys, database credentials, OS keychain), runs the priviledge broker and its approval prompt,
@@ -63,7 +63,7 @@ session's grant, reading its socket traffic, or acting as it — they are one pr
 kernel. Consequences:
 
 - **One AI-workspace uid per trust domain.** If two projects (or a trusted model and an
-  experimental one) must not impersonate each other, they get separate uids (`ws-a`, `ws-b`),
+  experimental one) must not impersonate each other, they get separate uids (`aiws-a`, `aiws-b`),
   and typically **one broker per uid** (§5, §11), each with its own socket and approval pane.
 - The broker authenticates every caller by **kernel-provided peer credentials** (§11), which
   give the uid unspoofably. Grants (auto-approve windows, etc.) are keyed to the uid.
@@ -175,7 +175,7 @@ priviledge run prod-db-ro -o counts.csv -r "..." < query.sql   # the client writ
 - Parameters travel **by value**: the payload on stdin, arguments after `--`, and named
   parameters as `-p key=value`. A file the agent wants to use (a `.sql` or a Ruby script) is read
   by the *client* and sent as content. The broker never opens workspace paths.
-- Outputs travel **over the socket**. `-o file` is written by the client, as the `ws` user.
+- Outputs travel **over the socket**. `-o file` is written by the client, as the `aiws` user.
   The broker never writes into workspace paths, because a privileged process writing to a path
   the workspace controls can be redirected elsewhere through links.
 - Exit status mirrors the resource's exit status. Denials exit non-zero with the human's message
@@ -189,7 +189,7 @@ priviledge run prod-db-ro -o counts.csv -r "..." < query.sql   # the client writ
 The approval prompt is line-oriented, like `git add -p`:
 
 ```
-[12] ws · ~/src/shop-app · prod-db-ro
+[12] aiws · ~/src/shop-app · prod-db-ro
      reason: count overdue orders by region
      SELECT region, count(*) FROM orders WHERE status = 'open' GROUP BY region
 run? [y]es [n]o(+msg) [e]dit [v]iew [?]
@@ -207,8 +207,13 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact
 - **All agent-supplied text is rendered with control characters escaped.** Requests and outputs
   must not be able to move the cursor, hide lines, restyle the prompt, or send queries to the
   terminal.
-- `edit`/`view` open content in `$PRIVILEDGE_REVIEW_EDITOR` (aliases `$SECURE_EDITOR`,
-  `$RAW_EDITOR`); `view` otherwise pipes through `less` without `-R`.
+- The inline prompt shows escaped plain text with stdlib-only formatting (JSON pretty-printed,
+  CSV aligned). No highlighter dependency in priviledge itself.
+- `view` writes the content to a privileged-owned temp file (extension from the resource's
+  `syntax` / `output_syntax` hint, §7) and opens `$PRIVILEDGE_REVIEW_PAGER` (default `less`
+  without `-R`). `edit` does the same with `$PRIVILEDGE_REVIEW_EDITOR` (default `vi`). Both can
+  point at the same minimal nvim, the pager in read-only mode:
+  `nvim -R -u ~/.config/priviledge/review.lua`.
 
 ### The review editor runs as privileged over hostile content
 
@@ -222,11 +227,11 @@ past a tired reviewer, so the review surface should be comfortable **and** minim
   untrusted input and have had memory-safety bugs, though they do not execute project code.
   Acceptable for highlighting **if** the review config is privileged-owned and plugin-free so the
   workspace cannot alter it. Omit it if you want to be strict about the raw approval payload.
-- **Default:** a minimal privileged-owned nvim config (syntax + git navigation, no plugins that
-  execute, no LSP), or plain `less`.
+- **Default:** a minimal privileged-owned nvim config (syntax colouring via vim syntax or
+  treesitter, git navigation, no plugins that execute, no LSP), or plain `less`. Syntax
+  colouring and formatting matter: they make a sneaked-in change easier to spot.
 - **Diff review before push is a separate, lower-hostility moment** (you are judging code, not
-  handling an active payload). A git GUI that does not run project code is a good fit here —
-  **Sublime Merge** qualifies (no build, no LSP), as does `git` + `delta` + `less`. See §8.
+  handling an active payload). See §8 for the two-pass review.
 
 ### Confirmation flags (per resource)
 
@@ -251,6 +256,8 @@ executable is group- or world-writable, or not owned by the privileged user.
 description = "Production Postgres (read-only role). Bound queries on large tables by time."
 run = "~/.config/priviledge/resources/prod-db-ro"
 input = "stdin"            # payload = SQL text
+syntax = "sql"             # review hint for the request payload
+output_syntax = "csv"      # review hint for the output
 credential = "read-only"   # declared by the human; documents what the credential enforces
 confirm_request = false    # auto-approve the run (allowed: credential is read-only)
 confirm_output = false     # and auto-release the output
@@ -259,6 +266,8 @@ confirm_output = false     # and auto-release the output
 description = "Production Postgres (read-write role). Always ask."
 run = "~/.config/priviledge/resources/prod-db-rw"
 input = "stdin"
+syntax = "sql"
+output_syntax = "csv"
 credential = "read-write"
 # confirm_request and confirm_output default to true
 ```
@@ -299,19 +308,32 @@ slower but simple and safe.
 - The AI-workspace clone's `origin` is the upstream with a **read-only** token. Fetch and pull
   work; push is rejected by the server. Push is never native to the workspace (§4).
 - Each repo has a **privileged clean clone** with two remotes: `origin` (upstream, read-write key)
-  and `ws` (`ws:src/<repo>`, over ssh to the workspace).
+  and `aiws` (`aiws:src/<repo>`, over ssh to the workspace).
 - The privileged side **pulls from** the workspace; the workspace pushes nowhere with credentials.
   Review and push, without checking anything out:
 
   ```sh
-  git fetch ws feature-x
-  git log -p origin/develop..ws/feature-x
-  git push origin ws/feature-x:feature-x
+  git fetch aiws feature-x
+  git log -p origin/develop..aiws/feature-x
+  git push origin aiws/feature-x:feature-x
   ```
 
-  Fetching over ssh runs git on the workspace side as the `ws` user. The privileged side only
+  Fetching over ssh runs git on the workspace side as the `aiws` user. The privileged side only
   receives pack data (inert until checked out), the same trust model as fetching from any remote,
   and `git fetch` does not run the remote's hooks.
+- **Never run git (or a git GUI) as privileged against the workspace's working tree.** git
+  executes things named in repo config (`core.fsmonitor` and others), and that config is
+  agent-writable. Privileged git runs only in the clean clone.
+- **Two-pass review:**
+  1. *Comprehension pass* in the AI workspace, with full nvim and LSP navigation. Comfortable,
+     but not authoritative: the review tooling there is agent-controlled (git diff drivers and
+     textconv, pagers, editor plugins can render something other than the commit's content).
+     Matching SHAs afterwards only proves the commit identity, not what was displayed.
+  2. *Authoritative pass* on the privileged side over the fetched objects, in a git tool that
+     does not run project code: **Sublime Merge** (syntax-highlighted; its regex-based
+     highlighting is the same small parsing risk as treesitter), or `git` + `delta` + `less`.
+     This pass is quick because the change is already understood; it checks that the change is
+     what was reviewed and catches anything new.
 - Deploys and infrastructure changes (`cap`, `tofu`, etc.) run from the clean clone, checked out
   at the reviewed commit. This does execute repo code with privileges, which is inherent. The
   guarantee is integrity: *what runs is exactly what was reviewed*.
@@ -329,11 +351,11 @@ slower but simple and safe.
 
 ## 10. Prerequisites and hygiene
 
-- **The privileged home is not traversable by `ws`.** Since `ws` is not in the privileged user's
+- **The privileged home is not traversable by `aiws`.** Since `aiws` is not in the privileged user's
   group (it is only ever "other"), removing others' access is enough: `chmod o-rwx ~` (or
-  `chmod 750 ~`). Verify with the checklist (`ls /Users/<me>` fails from `ws`), which also
+  `chmod 750 ~`). Verify with the checklist (`ls /Users/<me>` fails from `aiws`), which also
   settles the macOS home ACL (the `+` in `ls -le ~`) **(verify)** — the ACL must not grant
-  `everyone`. The repos live under `~ws` anyway; what matters is that the *privileged* home is
+  `everyone`. The repos live under `~aiws` anyway; what matters is that the *privileged* home is
   closed.
 - No secrets in workspace-readable trees. Move personal env files, credential notes and backups
   out of the repos into the privileged home. Tracked secrets are a team issue: rotation and
@@ -348,9 +370,9 @@ slower but simple and safe.
 - Config, state and data follow the **XDG Base Directory** spec: `$XDG_CONFIG_HOME/priviledge`
   (config, §7), `$XDG_STATE_HOME/priviledge` (audit log), `$XDG_DATA_HOME/priviledge`. These are
   privileged-private.
-- The **socket** cannot live in `$XDG_RUNTIME_DIR` (that is per-user, mode 0700, so `ws` could
+- The **socket** cannot live in `$XDG_RUNTIME_DIR` (that is per-user, mode 0700, so `aiws` could
   not reach it). It goes in a shared, privileged-owned directory the workspace can traverse but
-  not write to: directory group `priviledge` mode 0750, socket group `priviledge` mode 0660, `ws`
+  not write to: directory group `priviledge` mode 0750, socket group `priviledge` mode 0660, `aiws`
   a member of the group.
   - macOS default: `/Users/Shared/priviledge/`.
   - Linux default: a configurable directory such as `/var/lib/priviledge/` (or a systemd
@@ -380,7 +402,7 @@ the human reviews and runs them.
 
 The priviledge design is identical across all three; only how the AI workspace is hosted changes:
 
-- **`su`/`sudo -u ws` (weakest, no sshd).** Simplest, but on macOS `su` does not allocate a new
+- **`su`/`sudo -u aiws` (weakest, no sshd).** Simplest, but on macOS `su` does not allocate a new
   controlling tty, so the workspace shell shares the privileged pane's terminal device — a path
   back up. Acceptable only if you do not want to run sshd. Documented, not recommended.
 - **ssh to loopback (recommended).** Each pane is a fresh, workspace-owned pty; nothing shared
@@ -394,30 +416,30 @@ The priviledge design is identical across all three; only how the AI workspace i
 
 ```sh
 # macOS
-sudo sysadminctl -addUser ws -fullName "AI workspace" -password -
-sudo dscl . create /Users/ws IsHidden 1
+sudo sysadminctl -addUser aiws -fullName "AI workspace" -password -
+sudo dscl . create /Users/aiws IsHidden 1
 sudo dseditgroup -o create priviledge
-sudo dseditgroup -o edit -a ws -t user priviledge
-chmod o-rwx ~                    # privileged home closed to ws (ws is not in the staff group)
+sudo dseditgroup -o edit -a aiws -t user priviledge
+chmod o-rwx ~                    # privileged home closed to aiws (aiws is not in the staff group)
 
 # Linux
-sudo useradd -m -s /bin/zsh ws
-sudo groupadd priviledge && sudo usermod -aG priviledge ws
+sudo useradd -m -s /bin/zsh aiws
+sudo groupadd priviledge && sudo usermod -aG priviledge aiws
 chmod o-rwx ~
 ```
 
-For per-project isolation (§3), repeat with `ws-<project>` users; each gets its own broker.
+For per-project isolation (§3), repeat with `aiws-<project>` users; each gets its own broker.
 
 ### 12.2 ssh to localhost (the only way into the AI workspace)
 
 Panes enter the workspace with `ssh`, not `su`. ssh gives each session its own pty owned by the
 workspace user, so nothing running there shares a terminal device with the privileged shell.
 
-Enable Remote Login (macOS: System Settings → General → Sharing → Remote Login, allowed for `ws`
+Enable Remote Login (macOS: System Settings → General → Sharing → Remote Login, allowed for `aiws`
 only). Then add `/etc/ssh/sshd_config.d/100-priviledge.conf`:
 
 ```
-AllowUsers ws@127.0.0.1 ws@::1
+AllowUsers aiws@127.0.0.1 aiws@::1
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 AllowAgentForwarding no
@@ -433,18 +455,18 @@ On macOS, sshd is started by launchd on all interfaces, and `ListenAddress` may 
 Use a dedicated key, separate from any upstream key:
 
 ```sh
-ssh-keygen -t ed25519 -f ~/.ssh/id_ws -N ''
-# as ws, in ~ws/.ssh/authorized_keys:
-#   restrict,pty ssh-ed25519 AAAA... privileged-to-ws
+ssh-keygen -t ed25519 -f ~/.ssh/id_aiws -N ''
+# as aiws, in ~aiws/.ssh/authorized_keys:
+#   restrict,pty ssh-ed25519 AAAA... privileged-to-aiws
 ```
 
 Privileged `~/.ssh/config`:
 
 ```
-Host ws
+Host aiws
   HostName 127.0.0.1
-  User ws
-  IdentityFile ~/.ssh/id_ws
+  User aiws
+  IdentityFile ~/.ssh/id_aiws
   IdentitiesOnly yes
   ForwardAgent no
   ForwardX11 no
@@ -481,9 +503,9 @@ A per-project layout:
 
 ```sh
 # ~/bin/pp-shop
-tmux new-window -n shop   'ssh ws -t "cd src/shop-app && exec \$SHELL -l"'   # nvim
-tmux split-window -h      'ssh ws -t "cd src/shop-app && exec claude"'        # agent
-tmux split-window -v      'ssh ws -t "cd src/shop-app && exec \$SHELL -l"'   # tests, servers
+tmux new-window -n shop   'ssh aiws -t "cd src/shop-app && exec \$SHELL -l"'   # nvim
+tmux split-window -h      'ssh aiws -t "cd src/shop-app && exec claude"'        # agent
+tmux split-window -v      'ssh aiws -t "cd src/shop-app && exec \$SHELL -l"'   # tests, servers
 ```
 
 Plus one privileged window per machine:
@@ -493,42 +515,43 @@ Plus one privileged window per machine:
 
 ### 12.4 Editor and LSP (AI workspace)
 
-- nvim, its plugins and every LSP server run as `ws`: ruby-lsp, typescript-language-server,
-  basedpyright/pyright, lua_ls, and so on. A plugin manager and mason.nvim install into `~ws`.
-- nvim configuration is a copy or a clone of the human's dotfiles in `~ws`. It is never a
-  symlink into the privileged home, which ws cannot read anyway.
-- VS Code, optionally, via Remote-SSH to `ws`, so its extensions and LSP servers run as ws.
-- The privileged user does not open workspace repos in a full editor or LSP. For diff review use
-  a git tool that does not run project code — **Sublime Merge**, or `git` + `delta` + `less` — in
-  the clean clone (§6). This is distinct from the minimal `$PRIVILEDGE_REVIEW_EDITOR` used to
-  inspect a priviledge request/output payload.
+- nvim, its plugins and every LSP server run as `aiws`: ruby-lsp, typescript-language-server,
+  basedpyright/pyright, lua_ls, and so on. A plugin manager and mason.nvim install into `~aiws`.
+- nvim configuration is a copy or a clone of the human's dotfiles in `~aiws`. It is never a
+  symlink into the privileged home, which aiws cannot read anyway.
+- VS Code, optionally, via Remote-SSH to `aiws`, so its extensions and LSP servers run as aiws.
+- The privileged user does not open workspace repos in a full editor or LSP. Diff review follows
+  the two-pass model in §8. This is distinct from the minimal `$PRIVILEDGE_REVIEW_PAGER` /
+  `$PRIVILEDGE_REVIEW_EDITOR` used to inspect a priviledge request/output payload (§6).
 
 ### 12.5 Toolchains (AI workspace)
 
-- `ws` owns its own toolchains, for example with mise: Python, Node, Java, Go.
-  Project-specific installs (pip, npm, uv) all happen as ws.
+- `aiws` owns its own toolchains, for example with mise: Python, Node, Java, Go.
+  Project-specific installs (pip, npm, uv) all happen as aiws.
 - The privileged `PATH` never includes workspace-writable directories.
-- **Homebrew.** Two options:
-  - `ws` runs its own brew prefix (or just mise-managed tools), fully independent. Cleanest.
-  - Share one brew installation across the human's accounts. A common pattern is a single owner
-    (say `owner`) and an alias for another *trusted* account: `brew='sudo -Hu owner brew'`,
-    with files shared through standard group permissions. **This must never be given to `ws`:**
-    `sudo -u <privileged>` is escalation *into* the privileged user, so a rogue workspace with
-    that alias owns the privileged account outright. `ws` gets no sudo to any privileged user;
-    it may only *run* brew-installed binaries read-only, which is safe.
+- **Homebrew.** `aiws` may *run* the privileged user's brew-installed binaries read-only, which
+  is safe. Installs needed by the workspace are done by the human from a privileged pane, or
+  `aiws` uses its own brew prefix or mise-managed tools.
+  - Sharing one brew across the human's own trusted accounts with an alias like
+    `brew='sudo -Hu <owner> brew'` is fine between those accounts.
+  - **It must never be set up for `aiws`.** sudo authenticates the *caller*, so the rule would be
+    protected only by aiws's own password and sudo's cached timestamp, both reachable by other
+    aiws processes (same-uid processes are not isolated, §3). And running brew as the owner with
+    agent-influenced inputs (formulae are Ruby; taps, local formula files, Brewfiles) is
+    equivalent to a shell as the owner.
 
 ### 12.6 Repositories and agent (AI workspace)
 
-- Repos live under `~ws/src/`, owned by ws, cloned fresh (no migration of existing checkouts).
+- Repos live under `~aiws/src/`, owned by aiws, cloned fresh (no migration of existing checkouts).
   Per-path tool state (Claude Code per-project memory, `mise trust`, `direnv allow`) simply
-  re-initialises under the new paths in `ws`.
+  re-initialises under the new paths in `aiws`.
 - git: identity, a copy of the global gitignore, and read-only upstream tokens.
-- Claude Code runs as ws with its own login and the copied global instructions and memories. Its
+- Claude Code runs as aiws with its own login and the copied global instructions and memories. Its
   permission allow-list includes `Bash(priviledge list)`, `Bash(priviledge describe:*)`,
   `Bash(priviledge run:*)` and `Bash(priviledge wait:*)`.
-- Native read-only tokens (§4) live in ws's environment or config.
+- Native read-only tokens (§4) live in aiws's environment or config.
 
-### 12.7 Verification checklist (run as ws)
+### 12.7 Verification checklist (run as aiws)
 
 - `ls /Users/<me>` fails. `cat ~<me>/.aws/credentials` fails.
 - `ssh <me>@localhost` is refused.
