@@ -6,10 +6,12 @@ in [SPEC.md §4](SPEC.md#4-deployment-contract). Other setups are sketched in §
 **(verify)** must be checked on the real machine. Every command here changes the machine's
 configuration, so the human reviews and runs it.
 
+Terms (guest, privileged side, broker) are as defined in [SPEC.md §3](SPEC.md#3-threat-model).
+
 ## 1. Overview
 
 ```
-host: privileged account                         Docker VM
+host: privileged side                            Docker VM
 ┌───────────────────────────────────────┐   ┌──────────────────────────────────┐
 │ terminal + tmux                       │   │ guest aiws-shop (container)      │
 │   panes: docker exec -it aiws-shop …  │──▶│   nvim + LSP, claude, tests,     │
@@ -17,8 +19,8 @@ host: privileged account                         Docker VM
 │ secrets, priviledge config             │   │   repos in a volume              │
 │ clean clones (review, push, deploy)   │   │   dotfiles mounted read-only     │
 │ docker CLI (runtime control)          │   ├──────────────────────────────────┤
-└───────────────────────────────────────┘   │ dev services (project compose)   │
-                                            │ on the guest's network           │
+│ browser                               │   │ dev services (project compose)   │
+└───────────────────────────────────────┘   │ on the guest's network           │
                                             └──────────────────────────────────┘
 ```
 
@@ -27,8 +29,8 @@ host: privileged account                         Docker VM
 - On macOS, all containers run inside the runtime's Linux VM, so the host is behind a VM boundary.
   Guests are separated from each other by kernel namespaces inside that VM, which is weaker but
   adequate for project-vs-project trust.
-- The privileged account never runs anything from a guest. It drives guests only through the
-  runtime's CLI.
+- The privileged side drives guests only through the runtime's CLI, and never runs code written in
+  a guest except reviewed code at a pinned commit (§7, §8).
 
 ## 2. Container runtime
 
@@ -38,17 +40,18 @@ Any runtime with a Docker-compatible CLI works: Docker Desktop, colima, Podman. 
 - **Licensing:** Docker Desktop is free for personal use and for companies with fewer than 250
   employees *and* less than $10M revenue; beyond that it needs a paid subscription. colima and
   Podman are free. OrbStack is paid for commercial use.
-- **File sharing:** restrict the runtime's shared host paths to the two directories guests mount
-  (§3): the dotfiles directory and the exchange directory. Not `/Users`. If a guest escaped into
-  the runtime's VM, it would reach whatever the VM can see **(verify)** that Docker Desktop allows
-  removing the defaults.
+- **File sharing:** restrict the runtime's shared host paths to what containers actually mount:
+  the dotfiles and exchange directories (§3), and the clean-clone paths that project compose files
+  bind-mount (§8). Not all of `/Users`. If a guest escaped into the runtime's VM, it would reach
+  whatever the VM can see, including those clean clones. **(verify)** that Docker Desktop allows
+  removing the default paths.
 - **Never** give a guest the runtime's control socket (`/var/run/docker.sock` or equivalent),
-  `privileged: true`, host networking, or host PID namespace. Any of these hands the guest the
+  `privileged: true`, host networking, or the host PID namespace. Any of these hands the guest the
   privileged side.
 
 ## 3. Guests
 
-Guests are defined in a privileged-owned compose file, so their configuration is outside the
+Guests are defined in a privileged-owned compose file, so their configuration is out of the
 guests' reach.
 
 ```yaml
@@ -66,6 +69,8 @@ services:
     environment:
       TERM: xterm-256color
     networks: [shop]
+    ports:
+      - "127.0.0.1:5000:5000"                             # dev servers opened in the browser
     volumes:
       - shop-home:/home/aiws                              # repos, caches, toolchains, agent state
       - ${HOME}/.config/aiws/dotfiles:/home/aiws/.dotfiles:ro
@@ -73,21 +78,24 @@ services:
 
 networks:
   shop:
-    name: aiws-shop        # one network per project; guests cannot reach each other
+    name: aiws-shop        # one network per project
 
 volumes:
   shop-home:
 ```
 
-- **Repos live in the guest's volume**, not on the host filesystem. The privileged side can't
+- **Repos live in the guest's home volume**, not on the host filesystem. The privileged side can't
   accidentally run git or an editor against them; it reaches them only through the `ext::` remote
   (§7).
-- **Dotfiles are mounted read-only** from the privileged side: nvim config, shell config, git
-  config (no credentials), Claude Code global instructions. Change them once on the host and every
-  guest sees it. Inside the guest, link them into place once, e.g.
-  `ln -s ~/.dotfiles/nvim ~/.config/nvim`. They must never contain secrets.
+- **Dotfiles are mounted read-only**: nvim config, shell config, git config (no credentials), the
+  global gitignore, Claude Code's global instructions. Change them once on the host and every guest
+  sees it. Inside the guest, link them into place once (`ln -s ~/.dotfiles/nvim ~/.config/nvim`).
+  They must never contain secrets.
 - **The exchange directory** is the one writable host path, for screenshots, CSVs and similar.
-  On the host, treat its contents like untrusted downloads.
+  Create it before the first `up`. On the host, treat its contents like untrusted downloads.
+- **Published ports** are bound to `127.0.0.1` and chosen per project to avoid clashes. Note that
+  they are also reachable from other guests (§9), so the per-project network only isolates
+  unpublished ports.
 - Adding a project is a new service, network and volume in this file.
 
 ## 4. Image
@@ -101,21 +109,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git less openssh-client ripgrep fd-find zsh \
       build-essential postgresql-client locales \
     && rm -rf /var/lib/apt/lists/*
-# Install here: a current nvim release, mise, Claude Code, and the priviledge client/relay.
+# Also install system-wide (under /usr/local): a current nvim release, mise, and the priviledge
+# client/relay.
 RUN useradd -m -s /bin/zsh aiws
 USER aiws
 WORKDIR /home/aiws
 ```
 
-- Project toolchains (Python, Node, Java, Go) are installed with mise into the guest's
-  home volume, so they persist and stay per guest. Baking them into per-project images
-  (`FROM aiws-base`) is the more reproducible option once they settle.
-- No sudo in the guest. Installing system packages means rebuilding the image from the privileged
-  side.
+- **Install image-managed tools system-wide**, never into `/home/aiws`. The home is a volume:
+  Docker copies the image's home into it only when the volume is first created, so later image
+  updates to anything under the home would never reach the guest.
+- **Per-user and self-updating tools live in the home volume** and are installed from inside the
+  guest: Claude Code (it self-updates), mise-managed toolchains (Python, Node, Java,
+  Go), nvim plugins and LSP servers. Baking toolchains into per-project images (`FROM aiws-base`)
+  is the more reproducible option once they settle.
+- No sudo in the guest; `cap_drop` and `no-new-privileges` would defeat it anyway. Installing
+  system packages means rebuilding the image from the privileged side.
 - The guest's copy of priviledge is only the client and relay. It can be any version; the broker's
   copy is what matters (SPEC.md §6).
 
-## 5. Terminal and tmux (privileged)
+## 5. Terminal and tmux (privileged side)
 
 A terminal that denies clipboard reads, Ghostty for example:
 
@@ -138,11 +151,16 @@ set -g bell-action other
 A helper to enter a guest, and a per-project window:
 
 ```sh
-# ~/bin/aiws  —  aiws <project> [command...]
+#!/bin/sh
+# ~/bin/aiws: aiws <project> [command...]
 p=$1; shift
-exec docker exec -it -w /home/aiws/src "aiws-$p" "${@:-zsh}"
+[ $# -gt 0 ] || set -- zsh
+exec docker exec -it -w /home/aiws/src "aiws-$p" "$@"
+```
 
-# ~/bin/aiws-window  —  aiws-window <project>
+```sh
+#!/bin/sh
+# ~/bin/aiws-window: aiws-window <project>
 p=$1
 tmux new-window -n "$p" "aiws $p nvim"
 tmux split-window -h "aiws $p claude"
@@ -154,24 +172,26 @@ tmux split-window -v "priviledge serve aiws-$p"     # approvals for this project
   so no terminal device is shared with the guest. What remains is escape sequences in guest
   output, which is why clipboard reads are denied and priviledge escapes agent text.
 - The terminal's `TERM` (`xterm-ghostty`, say) needs its terminfo in the image. Either
-  install it or use `xterm-256color` as above.
-- A privileged window per machine holds a shell in the clean clones (§7) for review, push, deploy
-  and project compose.
+  install it or use `xterm-256color`, as in §3.
+- A privileged window holds a shell in the clean clones (§7) for review, push, deploy and project
+  compose.
 
 ## 6. Editor, LSP and agent (inside the guest)
 
 - nvim, its plugins and every LSP server run in the guest: ruby-lsp, typescript-language-server,
-  basedpyright/pyright, lua_ls, and so on. A plugin manager and mason.nvim install into the home
+  basedpyright/pyright, lua_ls, and so on. The plugin manager and mason.nvim install into the home
   volume.
 - VS Code, optionally, with Dev Containers' "Attach to Running Container", which runs the VS Code
   server and its extensions inside the guest.
-- Claude Code is installed in the image and logged in inside the guest; its state lives in the
-  home volume. Its global `CLAUDE.md` is linked from the read-only dotfiles, so the agent cannot
-  rewrite its own global instructions. Its permission allow-list includes `Bash(priviledge list)`,
+- Claude Code runs in the guest, logged in there, with its state in the home volume. Its global
+  `CLAUDE.md` is linked from the read-only dotfiles, so the source stays intact on the host. The
+  agent could still replace the link in its own home; instructions are not a security control
+  (SPEC.md §3). Its permission allow-list includes `Bash(priviledge list)`,
   `Bash(priviledge describe:*)`, `Bash(priviledge run:*)` and `Bash(priviledge wait:*)`.
+- Browser automation (Playwright and similar) runs inside the guest as well.
 - Native read-only tokens (SPEC.md §5) live in the guest's environment or config.
 - Per-path tool state (Claude Code's per-project memory, `mise trust`, `direnv allow`) initialises
-  fresh in the guest. No migration of existing checkouts.
+  fresh in the guest. Existing checkouts are not migrated; clone fresh.
 
 ## 7. Git: clone, review, push, deploy
 
@@ -191,8 +211,9 @@ git config protocol.ext.allow user
 - `protocol.ext.allow user` allows `ext::` only for commands the human runs. git treats `ext::`
   as dangerous by default because a URL can run commands; `user` keeps it blocked for URLs coming
   from fetched content, such as submodules.
-- `git fetch aiws <branch>` runs `git-upload-pack` inside the guest and receives pack data, which
-  is inert until checked out. The guest's hooks don't run.
+- `git fetch aiws <branch>` runs `git-upload-pack` inside the guest. On the host, git only
+  receives and parses pack data, which is inert until checked out: the same trust model as
+  fetching from any remote.
 
 **Two-pass review:**
 
@@ -209,15 +230,15 @@ git config protocol.ext.allow user
 
 ```sh
 git fetch aiws feature-x
-git log -p origin/develop..aiws/feature-x          # or Sublime Merge
-git push origin aiws/feature-x:feature-x
-git worktree add ../shop-app-deploy <reviewed-sha> # deploys and tofu run from here
+git log -p origin/develop..aiws/feature-x                  # or Sublime Merge
+git push origin aiws/feature-x:refs/heads/feature-x        # full destination ref: the source is a remote-tracking branch
+git worktree add ../shop-app-deploy <reviewed-sha>         # deploys and tofu run from here
 ```
 
-Deploying executes repo code with privileges, which is inherent. The guarantee is integrity: what
-runs is exactly what was reviewed.
+Deploying runs code written in the guest with privileges. That is the reviewed-code exception of
+SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
 
-## 8. Dev services (project compose)
+## 8. Dev services and dev servers
 
 - The human runs each project's compose from the clean clone at a reviewed commit, so review
   covers its mounts, privileges and build contexts.
@@ -237,23 +258,29 @@ runs is exactly what was reviewed.
   ```
 
   `docker compose -f docker-compose.yml -f ~/.config/aiws/overrides/shop-app.yml up -d`
-  (`!override` needs a recent Compose **(verify)**).
+  (`!override` needs a recent Compose **(verify)**). Start the guests first: they create the
+  network.
 - The guest reaches services by name (`psql -h app-postgres`). Projects that hard-code
   `localhost` need their host settings overridden in the guest's environment.
+- **Dev servers run in the guest.** Services that call back into the dev server (a reverse proxy
+  container, for example) must point at the guest by name instead of `host.docker.internal`. The
+  human opens them in the browser through the guest's published ports (§3), preferably in a
+  separate browser profile from the one holding real sessions.
 - Dev databases that matter get snapshots or credentials: the guest can reach them.
 
 ## 9. Host exposure and hygiene
 
-- **Host loopback listeners.** On Docker Desktop, containers can reach services listening on the
-  host's loopback through `host.docker.internal` **(verify)**. Anything the privileged account
-  runs on localhost is then reachable from guests. Audit with `lsof -nP -iTCP -sTCP:LISTEN` and
-  make sure nothing sensitive listens without authentication. priviledge itself listens on nothing.
+- **Host loopback.** On Docker Desktop, containers can reach services listening on the host's
+  loopback through `host.docker.internal` **(verify)**. That includes other guests' and dev
+  services' published ports, and anything the privileged side runs on localhost. Audit with
+  `lsof -nP -iTCP -sTCP:LISTEN` and make sure nothing sensitive listens without authentication.
+  priviledge itself listens on nothing.
 - **No secrets in guests.** Nothing from the privileged home is mounted except the read-only
   dotfiles and the exchange directory.
 - **Tracked secrets in repos** reach the guest with the clone. They are a team issue: rotate and
   remove.
-- Guests need their own copy of the human's global gitignore (via dotfiles). Otherwise personal
-  files ignored only by the host's global ignore become committable.
+- **The global gitignore** must reach guests through the dotfiles. Otherwise personal files
+  ignored only by the host's global ignore become committable.
 
 ## 10. Other setups
 
@@ -263,7 +290,7 @@ The same priviledge configuration works with a different `channel` per guest:
 |---|---|---|
 | Docker / colima / Podman (this document) | `docker exec -i aiws-<p>` | VM boundary to the host on macOS |
 | Apple `container` (macOS 26) | `container exec -i aiws-<p>` **(verify)** | One lightweight VM per container: a VM boundary between guests too. Same OCI images |
-| Lima VM | `limactl shell aiws-<p>` or `ssh` | Full VM per guest; the agent can run its own Docker inside |
+| Lima VM | `limactl shell aiws-<p>` or `ssh` **(verify)** | Full VM per guest; the agent can run its own Docker inside |
 | Docker Sandboxes | its exec command, if it has one **(verify)** | microVM per sandbox; mounts the host project directory |
 | Separate OS user | `ssh aiws@127.0.0.1` or `sudo -u aiws` | See below |
 
@@ -286,13 +313,15 @@ shell as the owner.
 
 From inside a guest:
 
-- `ls /Users` shows nothing from the host.
+- `ls /Users` fails: no host paths.
+- `touch ~/.dotfiles/x` fails: dotfiles are read-only.
 - There is no runtime socket (`ls -l /var/run/docker.sock` fails) and `docker ps` fails.
 - `git push` to upstream is rejected by the server.
-- Other guests are unreachable (`getent hosts aiws-<other>` fails).
-- `priviledge list` works. Stopping the project's `priviledge serve` makes `run` fail fast.
+- Other guests don't resolve (`getent hosts aiws-<other>` fails).
+- `priviledge list` shows only this guest's resources. Stopping the project's `priviledge serve`
+  makes `run` fail fast.
 
 From the host:
 
-- The runtime's shared paths are only the dotfiles and exchange directories.
+- The runtime's shared paths are only the dotfiles, exchange and clean-clone directories.
 - Loopback listeners reachable via `host.docker.internal` are known and acceptable.
