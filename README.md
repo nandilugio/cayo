@@ -3,6 +3,30 @@
 A small POSIX broker that mediates AI agents' access to production, with human approval and output
 review.
 
+The agent asks, you approve in your own pane, and it gets the result without ever holding the
+credentials:
+
+```
+┌─ vim ───────────────────────────────────────┬─ ai-agent ─────────────────────────────┐
+│ src/links.rs                                │ ● Archiving idle links. How many       │
+│ 17  /// Links unopened for this many days.  │   would that touch in prod?            │
+│ 18  const IDLE_DAYS: i32 = 90;              │                                        │
+│ 19                                          │   $ id=$(priviledge request \          │
+│ 20  pub fn archive_idle(db: &mut Client)    │       prod-db-ro \                     │
+│ 21      -> Result<u64, Error> {             │       -r "links idle 90+ days" \       │
+│ 22      db.execute(ARCHIVE, &[&IDLE_DAYS])█ │       < idle.sql)                      │
+│ 23  }                                       │   $ priviledge wait "$id" &&           │
+│ ~                                           │       priviledge retrieve "$id"        │
+│                                             │   └ waiting for approval...            │
+├─ priviledge serve trusted shortener ────────┴────────────────────────────────────────┤
+│ [7] trusted/shortener · prod-db-ro                                                   │
+│     reason: links idle 90+ days                                                      │
+│     SELECT count(*) FROM links                                                       │
+│      WHERE last_opened < now() - interval '90 days'                                  │
+│ run? [y]es [Y]es+release [n]o(+msg) [s]kip [e]dit [v]iew [?] █                       │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
 **Status: definition stage.** There is no code yet. The design is being worked out in these
 documents:
 
