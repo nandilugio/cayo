@@ -2,7 +2,8 @@
 
 Status: draft. This describes **one** way to deploy the AI workspace around priviledge: Docker
 containers on macOS. priviledge itself does not depend on it; it only needs the deployment contract
-in [SPEC.md §4](SPEC.md#4-deployment-contract). Other setups are sketched in §10. Items marked
+in [SPEC.md §4](SPEC.md#4-deployment-contract); how priviledge uses the channel is in
+[DESIGN.md §2](DESIGN.md#2-channel-and-relay). Other setups are sketched in §10. Items marked
 **(verify)** must be checked on the real machine. Every command here changes the machine's
 configuration, so the human reviews and runs it.
 
@@ -92,11 +93,22 @@ volumes:
   sees it. Inside the guest, link them into place once (`ln -s ~/.dotfiles/nvim ~/.config/nvim`).
   They must never contain secrets.
 - **The exchange directory** is the one writable host path, for screenshots, CSVs and similar.
-  Create it before the first `up`. On the host, treat its contents like untrusted downloads.
-- **Published ports** are bound to `127.0.0.1` and chosen per project to avoid clashes. Note that
-  they are also reachable from other guests (§9), so the per-project network only isolates
-  unpublished ports.
-- Adding a project is a new service, network and volume in this file.
+  Create it before the first `up`. On the host, treat its contents like untrusted downloads. The
+  guest can also create symlinks there that point at host paths: a host tool that follows one
+  reads or overwrites the host file. Don't write into the directory over existing names, and
+  check with `ls -l` before opening what's there.
+- **Published ports** are bound to `127.0.0.1` and chosen per project to avoid clashes. Dev servers
+  must listen on `0.0.0.0` *inside* the guest for the published port to reach them (Django's dev
+  server, for one, defaults to `127.0.0.1`). Published ports are also reachable from other guests
+  (§9), so the per-project network only isolates unpublished ports.
+- Adding a project is a new service, network and volume in this file, plus a guest entry in
+  priviledge's config (SPEC.md §8):
+
+  ```toml
+  [guests.aiws-shop]
+  channel = ["docker", "exec", "-i", "aiws-shop"]
+  resources = [...]
+  ```
 
 ## 4. Image
 
@@ -125,8 +137,12 @@ WORKDIR /home/aiws
   is the more reproducible option once they settle.
 - No sudo in the guest; `cap_drop` and `no-new-privileges` would defeat it anyway. Installing
   system packages means rebuilding the image from the privileged side.
-- The guest's copy of priviledge is only the client and relay. It can be any version; the broker's
-  copy is what matters (SPEC.md §6).
+- The guest's copy of priviledge is only the client and relay, and must be on the default `PATH`
+  (the channel command runs it without a login shell). Its integrity doesn't matter; it only has
+  to speak a protocol version the broker accepts (DESIGN.md §3).
+- The broker's copy is what matters (SPEC.md §3): install it on the host from a privileged-owned
+  clean clone at a reviewed tag, never from a guest.
+- Create `~/src` in the guest once; the `aiws` helper (§5) starts there.
 
 ## 5. Terminal and tmux (privileged side)
 
@@ -188,7 +204,9 @@ tmux split-window -v "priviledge serve aiws-$p"     # approvals for this project
   agent could still replace the link in its own home; instructions are not a security control
   (SPEC.md §3). Its permission allow-list includes `Bash(priviledge list)`,
   `Bash(priviledge describe:*)`, `Bash(priviledge run:*)` and `Bash(priviledge wait:*)`.
-- Browser automation (Playwright and similar) runs inside the guest as well.
+- Browser automation (Playwright and similar) runs inside the guest as well. Chromium's own
+  sandbox may not start with all capabilities dropped; Playwright then needs Chromium's
+  `--no-sandbox`, leaving the guest as the boundary **(verify)**.
 - Native read-only tokens (SPEC.md §5) live in the guest's environment or config.
 - Per-path tool state (Claude Code's per-project memory, `mise trust`, `direnv allow`) initialises
   fresh in the guest. Existing checkouts are not migrated; clone fresh.
@@ -263,7 +281,8 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
 - The guest reaches services by name (`psql -h app-postgres`). Projects that hard-code
   `localhost` need their host settings overridden in the guest's environment.
 - **Dev servers run in the guest.** Services that call back into the dev server (a reverse proxy
-  container, for example) must point at the guest by name instead of `host.docker.internal`. The
+  container, for example) must be attached to the guest's network in the override too, and point
+  at the guest by name instead of `host.docker.internal`. The
   human opens them in the browser through the guest's published ports (§3), preferably in a
   separate browser profile from the one holding real sessions.
 - Dev databases that matter get snapshots or credentials: the guest can reach them.
@@ -300,8 +319,10 @@ or Podman, a sandboxed runtime (gVisor, Kata), or VMs.
 
 **Separate OS user** (the lightest option, no runtime): create the user, close the privileged home
 to it (`chmod o-rwx ~`; the user is not in the privileged user's group), and give it its own
-toolchains. Prefer `ssh` to loopback over `sudo -u`/`su`: on macOS `su` does not allocate a new
-terminal, so the guest shell shares the privileged pane's terminal device. For ssh: key-only
+toolchains. For interactive panes, prefer `ssh` to loopback over `sudo -u`/`su`: on macOS `su`
+does not allocate a new terminal, so the guest shell shares the privileged pane's terminal device.
+The channel has no terminal (the broker starts it detached, DESIGN.md §2), so `sudo -u aiws` is
+fine there. For ssh: key-only
 logins restricted to `AllowUsers aiws@127.0.0.1 aiws@::1`, no forwarding of any kind, and a
 dedicated key installed with `restrict,pty` (on macOS, launchd starts sshd on all interfaces and
 may ignore `ListenAddress` **(verify)**). Never give this user sudo to the privileged account,
