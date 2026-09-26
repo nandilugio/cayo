@@ -58,7 +58,7 @@ Non-goals:
   The human does their coding *inside* it.
 - **Guest**: the isolated environment the AI workspace runs in: a container, a VM, or a separate
   OS user. A guest is an instance of a **profile**, the named trust level that fixes what it may
-  reach and how much confirmation its requests need (§3, §8).
+  reach and how much confirmation its requests need (below, and §8).
 - **Privileged side** (trusted): the human's own account on the host. It holds the secrets (cloud
   credentials, ssh keys, database credentials, OS keychain), runs the broker and its approval
   prompt, holds the credentials for pushing and deploying, and controls the guest runtime.
@@ -139,8 +139,8 @@ guest shape (image, mounted credentials, egress policy). The reference set:
 | Profile | A: input | B: sensitive reach | C-state | C-egress |
 |---|---|---|---|---|
 | `trusted` | The human's own projects and vetted sources | Read-only resources may auto-approve; write resources ask | Through priviledge, asked | Allow-list |
-| `public` | Open-source work: public issues, PRs, general web | Read-only resources only, every request asks | Through priviledge, asked | Allow-list |
-| `hostile-web` | Content that may target automated readers | **Nothing**: no credentials, no resources | None | Broad, needed by the task; nothing worth leaking |
+| `public` | Open-source work: public issues, PRs, general web | No credentials in the guest; every request asks | Through priviledge, asked | Allow-list |
+| `hostile-web` | Content that may target automated readers | **Nothing**: no credentials, no resources | None | Broad to the internet, needed by the task; no host or local network |
 | `hostile-sample` | Samples, exploits, CTF material | Nothing | None | **None** |
 
 Two consequences worth stating:
@@ -149,7 +149,9 @@ Two consequences worth stating:
   to one's own repos (B) and pushing or commenting (C) is the full set in one session by default;
   `public` breaks it by keeping every write behind approval and no write credential in the guest.
 - **Hostile content is handled by removing B, not by trusting filters.** For `hostile-web` the
-  task needs broad egress, so the guest holds nothing worth taking. For samples, egress goes too.
+  task needs broad egress, so the guest holds nothing worth taking; the host and the local network
+  stay out of reach, since services there are something worth taking too. For samples, egress
+  goes too.
 
 The same project may need guests of different profiles: developing it in `trusted`, triaging its
 public tracker in `public`.
@@ -263,12 +265,12 @@ one thing, so any of them can be composed with other tools without ambiguity.
 - `priviledge request <resource> -r <reason> [-p key=value]... [-- args...] [< payload]`: submit a
   request. Prints the request id on stdout and exits at once.
 - `priviledge wait <id>... [--timeout <seconds>]`: block until every listed request is settled
-  (done, failed, denied or cancelled). Prints nothing on stdout. Without `--timeout` it waits
-  indefinitely.
+  (done, failed, denied or dropped). Prints nothing on stdout. Without `--timeout` it waits
+  indefinitely. It exits 0 once all are settled; `retrieve` then tells each outcome.
 - `priviledge retrieve <id>`: write the result to stdout. Never blocks: if the request is not
   settled, it exits with a distinct status.
-- `priviledge pending`: the ids and resources of this guest's unsettled requests.
-- `priviledge cancel <id>`: withdraw a request that has not started.
+- `priviledge pending`: this guest's requests not yet retrieved, with resource and state.
+- `priviledge cancel <id>`: withdraw a request that has not started. It is discarded.
 
 ```sh
 id=$(priviledge request prod-db-ro -r "count overdue orders by region" <<'SQL'
@@ -296,30 +298,33 @@ priviledge wait "$a" "$b" && priviledge retrieve "$a" | jq ... && priviledge ret
   the client wrote the last byte to its stdout without error and reported that to the broker; a
   broken pipe leaves the result in place for another `retrieve`. An agent that needs a result
   again keeps its own copy.
-- If the human edited the request, the result says so and includes the version that ran, so the
-  agent does not reason from a query it did not actually get answered. If the human redacted the
-  output, the result says so, so the agent does not take withheld data for absent data. The
-  original request and the unredacted output are never sent; they exist only in the audit log.
+- If the human edited the request, `retrieve` says so on stderr, followed by the version that ran,
+  so the agent does not reason from a query it did not actually get answered. If the human
+  redacted the output, it says so on stderr, so the agent does not take withheld data for absent
+  data. stdout carries only the result. The original request and the unredacted output are never
+  sent; they exist only in the audit log.
 
 **Exit status.** Resource executables never talk to the agent through exit codes (§8), so the
 client's own codes cannot collide with theirs:
 
-| Code | Meaning | Commands |
-|---|---|---|
-| 0 | Success. For `retrieve`: the resource succeeded and its output is on stdout | all |
-| 1 | The resource failed. stdout carries whatever the resource chose to tell the agent | `retrieve` |
-| 250 | Not settled (`retrieve`), or timed out (`wait`) | `wait`, `retrieve` |
-| 251 | Denied: the request, or the release of its output, with the human's message on stderr | `retrieve` |
-| 252 | Unknown id, already retrieved, or already settled (`cancel`) | `wait`, `retrieve`, `cancel` |
-| 253 | Invalid request: unknown resource, undeclared input, missing reason | `request`, `describe` |
-| 254 | Broker not connected | all |
+| Code | Meaning | Commands | The agent should |
+|---|---|---|---|
+| 0 | Success. For `retrieve`: the resource succeeded and its output is on stdout | all | |
+| 1 | The resource failed. stdout carries whatever the resource chose to tell the agent | `retrieve` | Read stdout |
+| 249 | Dropped: the broker connection was lost before the request ran; nothing happened | `retrieve` | Request again |
+| 250 | Not settled (`retrieve`), or timed out (`wait`) | `wait`, `retrieve` | Wait again |
+| 251 | Denied by the human, the request or the release of its output, with their message on stderr | `retrieve` | Not repeat it as is |
+| 252 | Unknown id: never existed, already retrieved, or cancelled by the agent | `wait`, `retrieve`, `cancel` | Nothing to fetch |
+| 253 | Invalid request: unknown resource, undeclared input, missing reason, or `cancel` on a request that already started | `request`, `describe`, `cancel` | Fix the call |
+| 254 | Broker not connected | all | Retry once it is back |
 
-Codes 250–254 are outside the ranges ordinary tools and shells use. Every non-zero exit comes
+Codes 249–254 are outside the ranges ordinary tools and shells use. Every non-zero exit comes
 with a one-line `priviledge: ...` message on stderr.
 
 **When the broker connection is lost** (guest restarted, broker stopped):
 
-- Requests still **awaiting approval** fail without running.
+- Requests that have **not started** are dropped: nothing ran, and `retrieve` reports 249 once the
+  connection is back, so the agent can request again.
 - Requests that are **running, awaiting release, or settled but not retrieved** may already have
   had effects (a write on a write resource). They are kept, flagged to the human as "not
   retrieved", and the agent can still `retrieve` them once the connection is back.
@@ -361,7 +366,8 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact
   aligned). Output is not size-limited; the prompt shows size and a head/tail preview.
 - `view` opens the content in `$PRIVILEDGE_REVIEW_PAGER`, from a privileged-owned temp file whose
   extension comes from the resource's `input_syntax` / `output_syntax` (§8). `edit` does the same
-  with `$PRIVILEDGE_REVIEW_EDITOR`. Both are argv strings, run without a shell; the defaults are
+  with `$PRIVILEDGE_REVIEW_EDITOR`. Both are argv strings, run without a shell, with the file's path
+  appended as the last argument; the defaults are
   `less` (without `-R`, and with its input preprocessor disabled) and `vi`. SETUP.md describes safe
   richer choices.
 
@@ -567,7 +573,9 @@ PGPASSWORD=$(security find-generic-password -s prod-db-ro -w) \
 auto-approved query can still load production. Bound the cost with a role-level or connection
 `statement_timeout`, as above.
 
-`args = true` on a broad credential should come with `confirm_request = true` in every profile.
+An auto-approved resource with `args = true` exposes everything its credential can read (§5,
+condition 2): a read-only cloud role can often read parameters, secrets stores and object storage.
+Narrow the credential, or the subcommands the executable allows, before auto-approving it.
 
 ### Human resources
 
@@ -630,7 +638,7 @@ document may still change, `1.0` when they stop.
 9. **A git credential helper backed by priviledge**, removing the last native token (§5).
 10. **Burst approvals**: "approve the rest from this resource for N minutes", read-only resources
     only.
-11. **A privileged-only approval interface for scripting** (`pending`, `approve`, `deny`).
+11. **A privileged-only approval interface for scripting** (`queue`, `approve`, `deny`).
 12. **An MCP adapter for the client's own commands** (`priviledge mcp`), only if a client needs
     it and it shows value over its cost. The CLI is POSIX-composable, works in every agent, and
     keeps the surface small and free of MCP spec churn.

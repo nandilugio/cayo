@@ -22,9 +22,18 @@ that guest, and each guest gets its own approval pane. The guest is identified e
 (prompt, audit log) as `<profile>/<name>`.
 
 **One request at a time.** The broker runs requests sequentially in arrival order (SPEC.md §7).
-A request's life: `received` → (checkers, later) → `awaiting-approval` or straight to `running`
-→ `awaiting-release` or straight to `settled` → `retrieved`, or `denied`/`failed`/`cancelled` at
-any point before `settled`.
+A request's states:
+
+```
+queued ─▶ awaiting-approval ─▶ running ─▶ awaiting-release ─▶ settled ─▶ (retrieved: discarded)
+```
+
+- `awaiting-approval` is skipped when `confirm_request = false`, `awaiting-release` when
+  `confirm_output = false` (or the human answered `Y`). Checkers, later, run on entering
+  `awaiting-approval`.
+- **settled** is one of `done`, `failed` (the resource exited non-zero), `denied` (at approval or
+  release) or `dropped` (the connection was lost before `running`).
+- `cancel` discards a request in `queued` or `awaiting-approval`; afterwards its id is unknown.
 
 Resources run as child processes of the broker, in their own session without a controlling
 terminal, with stdin, stdout and stderr connected to the request. They can't prompt on, or write
@@ -119,8 +128,9 @@ its result until a `retrieve` completes: the client sends `retrieved` after writ
 to its stdout without error, and only then does the broker discard the result (SPEC.md §6). A
 `retrieve` that ends early (broken pipe, killed client) leaves the result in place.
 
-When the channel ends, the broker marks the guest offline, applies the rules in SPEC.md §6
-(unapproved requests fail; requests that ran are kept as "not retrieved"), and restarts the
+When the channel ends, the broker marks the guest offline and applies the rules in SPEC.md §6:
+requests that have not started become `dropped` (exit 249 on `retrieve`); requests that are
+running, awaiting release or settled are kept and flagged "not retrieved". It then restarts the
 channel with backoff. When the relay's stdin closes or its heartbeat lapses, it removes its socket
 and exits, so clients fail fast with "broker not connected" (exit 254). A broker restart loses the
 in-memory requests; the audit log (§8) is the record.

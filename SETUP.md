@@ -47,7 +47,7 @@ needs `exec -i`.
   Podman are free. OrbStack is paid for commercial use.
 - **File sharing:** restrict the runtime's shared host paths to what containers actually mount:
   the dotfiles and exchange directories (§4), and the clean-clone paths that project compose files
-  bind-mount (§10). Not all of `/Users`. If a guest escaped into the runtime's VM, it would reach
+  bind-mount (§11). Not all of `/Users`. If a guest escaped into the runtime's VM, it would reach
   whatever the VM can see, including those clean clones. **(verify)** that Docker Desktop allows
   removing the default paths.
 - **Never** give a guest the runtime's control socket (`/var/run/docker.sock` or equivalent),
@@ -59,12 +59,12 @@ needs `exec -i`.
 Each profile in priviledge's configuration (SPEC.md §8) is implemented here as a guest shape. The
 reference set:
 
-| Profile | Image | Mounted | Native tokens | Egress |
+| Profile | Image | Mounted | Native tokens | Egress (§5) |
 |---|---|---|---|---|
-| `trusted` | `aiws-base` | home volume, dotfiles (ro), exchange | git read-only token | proxy allow-list (§5) |
-| `public` | `aiws-base` | same | git read-only token | proxy allow-list |
-| `hostile-web` | `aiws-base` | fresh home volume, exchange only | none | open network, nothing to leak |
-| `hostile-sample` | `aiws-base` | fresh home volume, exchange only | none | `--network none` |
+| `trusted` | `aiws-base` | home volume, dotfiles (ro), exchange | git read-only token | proxy, allow-list |
+| `public` | `aiws-base` | same | git read-only token | proxy, allow-list |
+| `hostile-web` | `aiws-base` | fresh home volume, exchange only | none | proxy, public internet only |
+| `hostile-sample` | `aiws-base` | fresh home volume, exchange only | none | none (`--network none`) |
 
 `hostile-*` guests are meant to be disposable: created for the task, removed after (`aiws rm`).
 No broker runs for them; results leave through the exchange directory, carried by the human.
@@ -83,31 +83,33 @@ case $cmd in
   new)
     p=$1; n=$2; g="aiws-$p-$n"
     docker volume create "$g-home" >/dev/null
+    mkdir -p "$HOME/aiws-exchange/$g"
+    home="-v $g-home:/home/aiws -v $HOME/aiws-exchange/$g:/home/aiws/exchange"
     case $p in
-      trusted|public)
-        docker network create --internal "$g" >/dev/null
-        aiws-egress "$g"                                  # proxy sidecar, §5
-        mounts="-v $g-home:/home/aiws \
-                -v $HOME/.config/aiws/dotfiles:/home/aiws/.dotfiles:ro \
-                -v $HOME/aiws-exchange/$g:/home/aiws/exchange"
-        net="--network $g -e HTTP_PROXY=http://$g-proxy:3128 -e HTTPS_PROXY=http://$g-proxy:3128" ;;
-      hostile-web)
-        mounts="-v $g-home:/home/aiws -v $HOME/aiws-exchange/$g:/home/aiws/exchange"
-        net="--network bridge" ;;
-      hostile-sample)
-        mounts="-v $g-home:/home/aiws -v $HOME/aiws-exchange/$g:/home/aiws/exchange"
-        net="--network none" ;;
+      trusted|public) mounts="$home -v $HOME/.config/aiws/dotfiles:/home/aiws/.dotfiles:ro"
+                      egress=allowlist ;;
+      hostile-web)    mounts=$home; egress=public ;;
+      hostile-sample) mounts=$home; egress=none ;;
       *) echo "unknown profile $p" >&2; exit 64 ;;
     esac
-    mkdir -p "$HOME/aiws-exchange/$g"
+    if [ "$egress" = none ]; then
+      net="--network none"
+    else
+      docker network create --internal "$g" >/dev/null
+      aiws-egress "$g" "$egress"                          # proxy sidecar, §5
+      px="http://$g-proxy:3128"; np="${AIWS_NO_PROXY:-localhost,127.0.0.1}"
+      net="--network $g -e http_proxy=$px -e https_proxy=$px -e HTTP_PROXY=$px -e HTTPS_PROXY=$px
+           -e no_proxy=$np -e NO_PROXY=$np"
+    fi
     docker run -d --name "$g" --hostname "$g" --init \
       --cap-drop ALL --security-opt no-new-privileges:true \
       -e TERM=xterm-256color $net $mounts \
-      -p "127.0.0.1:${AIWS_PORT:-5000}:5000" \
-      aiws-base sleep infinity >/dev/null ;;
+      aiws-base sleep infinity >/dev/null
+    [ "$p" = hostile-sample ] || aiws-port "$g" "${AIWS_PORT:-5000}" ;;
   rm)
     p=$1; n=$2; g="aiws-$p-$n"
-    docker rm -f "$g" "$g-proxy" 2>/dev/null; docker network rm "$g" 2>/dev/null
+    docker rm -f "$g" "$g-proxy" "$g-port" >/dev/null 2>&1 || true
+    docker network rm "$g" >/dev/null 2>&1 || true
     docker volume rm "$g-home" ;;
   *)
     p=$cmd; n=$1; shift; [ $# -gt 0 ] || set -- zsh
@@ -129,47 +131,71 @@ esac
   there that point at host paths: a host tool that follows one reads or overwrites the host file.
   Don't write into the directory over existing names, and check with `ls -l` before opening
   what's there.
-- **Published ports** are bound to `127.0.0.1` and chosen per guest (`AIWS_PORT`) to avoid
-  clashes. Dev servers must listen on `0.0.0.0` *inside* the guest for the published port to reach
-  them (Django's dev server, for one, defaults to `127.0.0.1`). Published ports are also reachable
-  from other guests (§11), so the per-guest network only isolates unpublished ports.
-- `hostile-web` uses the default bridge: no proxy, no allow-list, and no credentials to protect.
-  Its published port is still bound to loopback; drop `-p` if nothing needs the browser.
+- **Proxy variables** are set in both cases, because tools disagree on which they read (curl, for
+  one, ignores an uppercase `HTTP_PROXY`). `AIWS_NO_PROXY` adds the project's HTTP dev services
+  (§11), which would otherwise be sent to the proxy and refused.
+- **Published ports.** Docker does not publish ports for a container that is only on an internal
+  network, so a small forwarder does it (`aiws-port`, below), bound to `127.0.0.1` and chosen per
+  guest (`AIWS_PORT`) to avoid clashes. Dev servers must listen on `0.0.0.0` *inside* the guest for
+  it to reach them (Django's dev server, for one, defaults to `127.0.0.1`). Published ports are
+  reachable from other guests' networks through the host (§12), so they should not expose anything
+  that trusts its callers.
+
+```sh
+#!/bin/sh
+# ~/bin/aiws-port: aiws-port <guest> <port>
+# Created on the bridge so its port can be published, then attached to the guest's network.
+g=$1; port=$2
+docker run -d --name "$g-port" --network bridge -p "127.0.0.1:$port:$port" \
+  alpine/socat "TCP-LISTEN:$port,fork,reuseaddr" "TCP:$g:$port" >/dev/null
+docker network connect "$g" "$g-port"
+```
 
 ## 5. Egress
 
 Egress is part of a profile's C property (SPEC.md §3) and the deployment enforces it (SPEC.md §4,
-item 5). The mechanism for `trusted` and `public`: **the network denies, the proxy allows.**
+item 5). The mechanism for every guest with a network: **the network denies, the proxy allows.**
 
 - The guest is on an `--internal` Docker network, which has no route out. Non-HTTP TCP, UDP and
   external DNS simply have nowhere to go; the internal network blocks them, not the proxy.
-- A proxy sidecar joins that network *and* a normal one, and allows `CONNECT` and plain HTTP only
-  to an allow-list of hostnames. The guest's `HTTP_PROXY`/`HTTPS_PROXY` point at it. Honouring the
-  variables is voluntary, but a process that ignores them has no route at all.
+- A proxy sidecar is on that network *and* a normal one, and is the guest's only way out. The
+  guest's proxy variables point at it. Honouring them is voluntary, but a process that ignores them
+  has no route at all.
+- The proxy never connects to private, loopback or link-local addresses, which keeps the host,
+  other containers and the local network out of reach, including through an allowed name that
+  resolves to a private address.
+- Two modes: `allowlist` (`trusted`, `public`) allows only listed hostnames; `public`
+  (`hostile-web`) allows any public address. `hostile-sample` has no network at all.
 - No TLS interception: the proxy sees hostnames, not contents, and the guest needs no extra CA.
-
-`aiws-egress <guest>` starts the sidecar, for example Squid with a privileged-owned allow-list:
 
 ```sh
 #!/bin/sh
-# ~/bin/aiws-egress: aiws-egress <guest>
-g=$1
-docker run -d --name "$g-proxy" --network "$g" --network-alias "$g-proxy" \
-  -v "$HOME/.config/aiws/egress/$g.txt:/etc/squid/allow.txt:ro" \
-  -v "$HOME/.config/aiws/egress/squid.conf:/etc/squid/squid.conf:ro" \
+# ~/bin/aiws-egress: aiws-egress <guest> allowlist|public
+g=$1; mode=$2
+list=; [ "$mode" = allowlist ] && list="-v $HOME/.config/aiws/egress/$g.txt:/etc/squid/allow.txt:ro"
+docker run -d --name "$g-proxy" --network bridge $list \
+  -v "$HOME/.config/aiws/egress/squid-$mode.conf:/etc/squid/squid.conf:ro" \
   ubuntu/squid >/dev/null
-docker network connect bridge "$g-proxy"
+docker network connect --alias "$g-proxy" "$g" "$g-proxy"
 ```
 
 ```
-# ~/.config/aiws/egress/squid.conf (the relevant part)
+# ~/.config/aiws/egress/squid-allowlist.conf (the relevant part)
+acl private dst 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 127.0.0.0/8
+acl private dst 169.254.0.0/16 ::1 fc00::/7 fe80::/10
 acl allowed dstdomain "/etc/squid/allow.txt"
 acl SSL_ports port 443
 acl CONNECT method CONNECT
+http_access deny private
 http_access deny CONNECT !SSL_ports
 http_access allow allowed
 http_access deny all
 http_port 3128
+
+# ~/.config/aiws/egress/squid-public.conf: the same, without `allowed`, ending in
+http_access deny private
+http_access deny CONNECT !SSL_ports
+http_access allow all
 ```
 
 ```
@@ -185,9 +211,8 @@ http_port 3128
 Notes:
 
 - **(verify)** on Docker Desktop: that a container on an `--internal` network cannot reach
-  `host.docker.internal`, and that an explicit proxy on the same internal network is reachable
-  (a *gateway*-style sidecar that forwards frames is not: the daemon drops forwarded frames on
-  internal bridges).
+  `host.docker.internal`, that the proxy and the forwarder are reachable from it, and that the
+  forwarder's published port reaches the guest.
 - Squid is the boring choice. **iron-proxy** is the purpose-built alternative when **credential
   injection** is wanted: the guest holds a placeholder token and the proxy swaps in the real one at
   egress, so a native token (git's, SPEC.md §5) never enters the guest. It terminates TLS, so
@@ -387,22 +412,24 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
   network. Services keep their own `default` network for their own egress; the guest's network is
   internal.
 - The guest reaches services by name (`psql -h app-postgres`). Projects that hard-code
-  `localhost` need their host settings overridden in the guest's environment.
+  `localhost` need their host settings overridden in the guest's environment. HTTP services (a
+  search engine on port 9200, say) also go in the guest's `AIWS_NO_PROXY` (§4), or clients send
+  them to the egress proxy, which refuses them.
 - **Dev servers run in the guest.** Services that call back into the dev server (a reverse proxy
   container, for example) must be attached to the guest's network in the override too, and point
   at the guest by name instead of `host.docker.internal`. The human opens them in the browser
-  through the guest's published ports (§4), preferably in a separate browser profile from the one
+  through the guest's forwarded port (§4), preferably in a separate browser profile from the one
   holding real sessions.
 - Dev databases that matter get snapshots or credentials: the guest can reach them.
 
 ## 12. Host exposure and hygiene
 
 - **Host loopback.** On Docker Desktop, containers on a normal network can reach services
-  listening on the host's loopback through `host.docker.internal` **(verify)**. That includes
-  other guests' and dev services' published ports, and anything the privileged side runs on
-  localhost. Audit with `lsof -nP -iTCP -sTCP:LISTEN` and make sure nothing sensitive listens
-  without authentication. priviledge itself listens on nothing. Whether internal networks block
-  this is in §5's (verify) list.
+  listening on the host's loopback through `host.docker.internal` **(verify)**. Guests in this setup
+  are never on a normal network, and their proxies refuse private addresses (§5), but the
+  forwarders and dev-service containers are. Anything the privileged side runs on localhost, and
+  every published port, is reachable from those. Audit with `lsof -nP -iTCP -sTCP:LISTEN` and make
+  sure nothing sensitive listens without authentication. priviledge itself listens on nothing.
 - **No secrets in guests.** Nothing from the privileged home is mounted except the read-only
   dotfiles and the exchange directory.
 - **Tracked secrets in repos** reach the guest with the clone. They are a team issue: rotate and
@@ -450,14 +477,19 @@ From inside a `trusted` or `public` guest:
 - `git push` to upstream is rejected by the server.
 - Other guests don't resolve (`getent hosts aiws-<other>` fails).
 - `curl https://example.com` fails (not allow-listed); `curl https://<allowed host>` works;
-  `curl http://host.docker.internal:<port>` fails.
+  `curl http://host.docker.internal:<port>` fails, directly and through the proxy.
+- An HTTP dev service listed in `AIWS_NO_PROXY` answers by name.
 - `priviledge list` shows only this profile's resources. Stopping the guest's `priviledge serve`
   makes `request` fail fast.
+
+From inside a `hostile-web` guest: `curl https://example.com` works;
+`curl http://host.docker.internal` and an address on the local network both fail.
 
 From inside a `hostile-sample` guest: no network at all (`getent hosts example.com` fails).
 
 From the host:
 
+- A dev server started in a guest answers on `http://127.0.0.1:<AIWS_PORT>`.
 - The runtime's shared paths are only the dotfiles, exchange and clean-clone directories.
 - Loopback listeners reachable via `host.docker.internal` are known and acceptable.
 - The proxy's log shows only allow-listed hosts passing.
