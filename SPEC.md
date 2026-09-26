@@ -6,10 +6,11 @@ assumptions that must be checked on a real machine before they are relied upon.
 This document specifies **what** priviledge is and does: its purpose, security model, and the
 interfaces the agent and the human use. Two other documents cover the rest:
 
-- [DESIGN.md](DESIGN.md): **how** it is built. Processes, protocol, technology, implementation
-  plan. It can change without changing this document.
+- [DESIGN.md](DESIGN.md): **how** it is built. Processes, protocol, technology, first iterations.
+  It can change without changing this document.
 - [SETUP.md](SETUP.md): one reference deployment around it (container runtime, images, terminal,
-  editor, git remotes, egress). priviledge depends only on the deployment contract in §4.
+  editor, review tools, git remotes, egress). priviledge depends only on the deployment contract
+  in §4.
 
 ## 1. Problem
 
@@ -29,6 +30,8 @@ Goals:
 
 - A **real boundary**: an agent that is careless, confused, or actively hostile cannot use
   privileged credentials except through approved requests.
+- **Dependable approvals**: the human can tell what they are approving. Whatever makes a risky
+  request easier to spot, or blocks it outright, serves this goal before convenience does.
 - Low-friction approvals: most requests are reads, arrive in bursts, and should cost one key.
 - Output review before results reach the agent.
 - Small, POSIX-style, composable; macOS and Linux; minimal and stable dependencies.
@@ -40,30 +43,28 @@ Non-goals:
 - **Protecting production from malicious code that passes code review.** priviledge protects the
   developer's privileged context and mediates direct privileged actions. Code integrity is the job
   of review, CI, branch protection and deploy gates.
-- Mediating browser-only surfaces (cloud consoles, dashboards, admin UIs).
+- Automating browser-only surfaces (cloud consoles, dashboards, admin UIs). priviledge can
+  route such a task to the human instead (§8, human resources).
 - Network egress control. It is part of a guest's risk profile (§3) and the deployment provides
   it (§4); priviledge may later act as its approval backend (§10).
 - A team or multi-user product.
 
 ## 3. Threat model
 
-### Terms
-
-- **AI workspace**: the agent and everything it can influence.
-- **Guest**: the isolated environment the AI workspace runs in (a container, a VM, or a separate
-  OS user). A guest is an instance of a **profile** (below).
-- **Privileged side**: the human's own account on the host.
-- **Broker**: the part of priviledge on the privileged side that receives requests, asks the human,
-  and runs resources.
-
-### Principals
+### Parties
 
 - **AI workspace** (untrusted): the agent **and all development tooling**, including the human's
   editor, LSP servers, tests, dev servers, package installs, git working copies and toolchains.
   The human does their coding *inside* it.
-- **Privileged side** (trusted): holds the secrets (cloud credentials, ssh keys, database
-  credentials, OS keychain), runs the broker and its approval prompt, holds the credentials for
-  pushing and deploying, and controls the guest runtime.
+- **Guest**: the isolated environment the AI workspace runs in: a container, a VM, or a separate
+  OS user. A guest is an instance of a **profile**, the named trust level that fixes what it may
+  reach and how much confirmation its requests need (§3, §8).
+- **Privileged side** (trusted): the human's own account on the host. It holds the secrets (cloud
+  credentials, ssh keys, database credentials, OS keychain), runs the broker and its approval
+  prompt, holds the credentials for pushing and deploying, and controls the guest runtime.
+- **Broker**: the part of priviledge on the privileged side. It receives requests, asks the human,
+  runs resources, and keeps the audit log. One broker serves one guest.
+- **Client**: the part of priviledge inside the guest, the commands the agent runs (§6).
 
 Why the human's tooling lives in the AI workspace: any tool that interprets project files can run
 project code. LSP servers load `Gemfile`s, `node_modules` plugins, and virtualenv interpreters.
@@ -97,11 +98,12 @@ traffic, or acting as it. Consequences:
   must not impersonate each other, they run in separate guests.
 - **The broker must know which guest a request comes from without relying on anything the guest
   says.** No token, password or claim sent by the guest may serve as its identity; the guest must
-  have nothing to forge. (DESIGN.md §2 achieves this by having the broker open the connection into
+  have nothing to forge. (DESIGN.md §3 achieves this by having the broker open the connection into
   the guest itself.) A token scheme would not help anyway: whatever an honest client could present,
   another process in the same guest can obtain.
-- Session labels (working directory, pid, agent name) are sent by the client for the human's
-  convenience and shown as *claimed*. Nothing security-relevant may depend on them.
+- **The client sends nothing about itself.** No working directory, pid or agent name: such labels
+  could only be trusted if the guest were, and then they would not be needed. A request carries
+  the resource, its inputs, and the agent's stated reason, which is judged, not trusted.
 - What a guest may request, and with how much confirmation, is fixed by its profile (§8).
 - Anything configured inside the guest (the agent's permission settings, its instructions) is
   convenience, not a security control. The boundary is the guest itself.
@@ -111,29 +113,32 @@ traffic, or acting as it. Consequences:
 Prompt injection is unsolved: an agent that reads text an attacker controls may follow
 instructions in it, and no filter reliably prevents that. The more capable the agent, the more it
 can do with one injected instruction. So the design assumes the agent *will* eventually act on
-hostile input, and limits what that can reach. The widely used framing is Meta's *Agents Rule of
-Two* (and Willison's *lethal trifecta*, the same idea): an agent session has three risk properties,
-and holding all three at once is unsafe unless a human approves the third.
+hostile input, and limits what that can reach. The framing is Meta's *Agents Rule of Two*, which
+matches Willison's *lethal trifecta*: an agent has three risk properties, and holding all three at
+once is unsafe unless a human supervises.
 
-- **A. Processes untrustworthy input**: text or code an attacker may have written. Public issue
-  trackers, pull requests, arbitrary web pages, dependency sources, hostile samples.
-- **B. Has access to sensitive systems or private data**: credentials in the guest, priviledge
-  resources it may request, private source.
-- **C. Changes state or communicates externally**. Two parts, both C:
+- **A. Can process untrustworthy inputs**: text or code an attacker may have written. Public
+  issue trackers, pull requests, arbitrary web pages, dependency sources, hostile samples.
+- **B. Can have access to sensitive systems or private data**: credentials in the guest,
+  priviledge resources it may request, private source.
+- **C. Can change state or communicate externally.** Meta defines C as one property. This
+  document tags its two halves, because a deployment controls them with different means:
   - **C-state**: writes to anything outside the guest: pushes, PR comments, ticket edits, prod
     writes.
-  - **C-egress**: the ability to send data out of the guest at all. With unrestricted egress, any
-    leak needs nothing but `curl`.
+  - **C-egress**: sending data out of the guest at all. With unrestricted egress, any leak needs
+    nothing but `curl`.
+
+B and C meet at a credential: holding a write credential is B (access); using it is C-state.
 
 **Rule:** a guest may hold at most two of A, B and C outright. When a task needs all three, the
 third goes through a human step (priviledge approval for C-state, a human-carried transfer for
 egress) or is removed. The guest's **profile** is the concrete choice of B and C for a given
-level of A. Profiles are named in the configuration (§8); a deployment implements each one as a
+kind of A. Profiles are named in the configuration (§8); a deployment implements each one as a
 guest shape (image, mounted credentials, egress policy). The reference set:
 
 | Profile | A: input | B: sensitive reach | C-state | C-egress |
 |---|---|---|---|---|
-| `trusted` | The human's own projects and vetted sources | Read-only resources may auto-approve; read-write resources ask | Through priviledge, asked | Allow-list |
+| `trusted` | The human's own projects and vetted sources | Read-only resources may auto-approve; write resources ask | Through priviledge, asked | Allow-list |
 | `public` | Open-source work: public issues, PRs, general web | Read-only resources only, every request asks | Through priviledge, asked | Allow-list |
 | `hostile-web` | Content that may target automated readers | **Nothing**: no credentials, no resources | None | Broad, needed by the task; nothing worth leaking |
 | `hostile-sample` | Samples, exploits, CTF material | Nothing | None | **None** |
@@ -154,8 +159,8 @@ public tracker in `public`.
 - The broker is installed from a privileged-owned source (for example a clean clone at a reviewed
   tag). It must never run from a copy the AI workspace can write. This matters because priviledge
   itself will be developed in an AI workspace.
-- The guest-side client is untrusted like everything else in the guest. Its version and integrity
-  don't matter: whatever runs there speaks for that guest by definition.
+- The client is untrusted like everything else in the guest. Its version and integrity don't
+  matter: whatever runs there speaks for that guest by definition.
 
 ### What the boundary protects
 
@@ -177,7 +182,7 @@ public tracker in `public`.
 - Escape from the guest through a runtime or kernel vulnerability. The strength of this boundary
   is a deployment choice.
 - The human being misled by what the agent shows them. Mitigated by rendering request and output
-  content safely (§7) and by keeping approvals specific.
+  content safely (§7), by keeping approvals specific, and later by checkers (§10).
 
 ## 4. Deployment contract
 
@@ -186,10 +191,10 @@ free to change.
 
 1. **Separation.** The AI workspace cannot read or write the privileged side's secrets, priviledge's
    configuration, or its state.
-2. **A channel command.** The privileged side has a command that starts a process inside a given
-   guest with its stdin and stdout connected to the caller, for example `docker exec -i <name>`,
-   `container exec -i <name>`, `ssh <host>`, or `sudo -u <user>`. priviledge uses it to reach the
-   guest (DESIGN.md §2).
+2. **A way to run a program inside a guest.** The privileged side has a command that starts a
+   process inside a given guest with its stdin and stdout connected to the caller, for example
+   `docker exec -i <name>`, `container exec -i <name>`, `ssh <host>`, or `sudo -u <user>`.
+   priviledge uses it to reach the guest (`guest_exec`, §8; DESIGN.md §3).
 3. **No path back.** The guest has no way to act as the privileged side: no sudo to it, no
    credentials for it, no access to the guest runtime's control socket, no shared terminal
    device.
@@ -207,7 +212,7 @@ Every privileged capability is placed by one rule:
 There are two ways to give the AI workspace a capability:
 
 - **A priviledge resource** (§8). The credential stays on the privileged side; the agent invokes it
-  through `priviledge run`. Each profile decides whether it asks or auto-approves, and whether the
+  through the client. Each profile decides whether it asks or auto-approves, and whether the
   output is reviewed. Every use is audited.
 - **A native grant**: a token in the agent's own environment. Nothing stands between the agent
   and the token, so this is only acceptable when both hold:
@@ -219,7 +224,7 @@ There are two ways to give the AI workspace a capability:
 auto-approved: the credential never enters the guest, so it cannot leak; the resource is
 configured once and each profile sets its own confirmation; and its use is logged. A resource
 with auto-approval still exposes the *data* it returns to the guest, so condition 2 applies to
-it as well. Native grants remain for tools that cannot go through `priviledge run`, such as git's
+it as well. Native grants remain for tools that cannot go through the client, such as git's
 credential for `fetch` and `pull`.
 
 Classifying requests by content ("this SQL is a read") is never the security boundary; it may only
@@ -229,7 +234,7 @@ Initial placement (to be confirmed per service):
 
 | Capability | Placement | Notes |
 |---|---|---|
-| Git upstream read | Native, read-only token | git needs it non-interactively; a credential helper calling priviledge is possible later |
+| Git upstream read | Native, read-only token | git needs it non-interactively; a credential helper calling priviledge is in the backlog |
 | Git push | Privileged side only | Feeds the deploy pipeline; never native, never a resource |
 | PR/CI read (code host) | Resource, read-only token, auto-approve eligible | |
 | Error tracker read | Resource, read-only token, auto-approve eligible | Errors may contain PII: condition 2 per profile |
@@ -239,72 +244,98 @@ Initial placement (to be confirmed per service):
 | Prod DB, read-only role | Resource, auto-approve eligible | Role enforces read-only; bound query cost (§8) |
 | Prod DB, read-write | Resource, always ask | |
 | Cloud CLI | Resources per credential | e.g. a read-only policy vs an admin one |
-| Consoles and shells on remote hosts | Session resources (later, §10), always ask | Full power once inside |
+| Consoles and shells on remote hosts | Session resources (backlog, §10), always ask | Full power once inside |
+| Browser-only surfaces | Human resource (§8) | The human performs the step and returns the result |
 
-Hosted OAuth connectors (e.g. claude.ai integrations) request whatever scopes the connector
-defines, often including write. Treat them as full grants unless their scopes are confirmed.
+Hosted OAuth connectors (e.g. claude.ai integrations) run outside the machine and request
+whatever scopes the connector defines, often including write. They cannot be mediated from the
+host at all; the only control is whether the account has them.
 
 ## 6. Agent interface
 
-One program, `priviledge`. The agent uses these subcommands inside the guest:
+The client is one program, `priviledge`, used inside the guest. Every operation is asynchronous:
+a request is submitted, waited for, and retrieved, in three separate commands. Each command does
+one thing, so any of them can be composed with other tools without ambiguity.
 
 - `priviledge list`: the resources this guest may request.
-- `priviledge describe <resource>`: its description, whether it takes a payload or extra
-  arguments, its declared parameters, and whether it is auto-approved for this guest.
-- `priviledge run <resource> ...`: submit a request, wait, print the result.
-- `priviledge wait <id>`: resume waiting on a pending request.
+- `priviledge describe <resource>`: its description, what input it takes, its declared parameters,
+  and whether it is auto-approved for this guest.
+- `priviledge request <resource> -r <reason> [-p key=value]... [-- args...] [< payload]`: submit a
+  request. Prints the request id on stdout and exits at once.
+- `priviledge wait <id>... [--timeout <seconds>]`: block until every listed request is settled
+  (done, failed, denied or cancelled). Prints nothing on stdout. Without `--timeout` it waits
+  indefinitely.
+- `priviledge retrieve <id>`: write the result to stdout. Never blocks: if the request is not
+  settled, it exits with a distinct status.
+- `priviledge pending`: the ids and resources of this guest's unsettled requests.
+- `priviledge cancel <id>`: withdraw a request that has not started.
 
 ```sh
-priviledge list
-priviledge run prod-db-ro -r "count overdue orders by region" <<'SQL'
+id=$(priviledge request prod-db-ro -r "count overdue orders by region" <<'SQL'
 SELECT region, count(*) FROM orders WHERE status = 'open' GROUP BY region
 SQL
-priviledge run aws-readonly -r "find restarts" -- logs filter-log-events --log-group-name ...
-priviledge run prod-db-ro -o counts.csv -r "..." < query.sql   # the client writes the file
+)
+priviledge wait "$id" --timeout 100
+priviledge retrieve "$id" > counts.csv
+
+a=$(priviledge request aws-readonly -r "find restarts" -- logs filter-log-events ...)
+b=$(priviledge request prod-db-ro -r "recent refunds" < refunds.sql)
+priviledge wait "$a" "$b" && priviledge retrieve "$a" | jq ... && priviledge retrieve "$b"
 ```
 
 - `-r <reason>` is required. It is shown to the human and written to the audit log.
 - Inputs travel **by value**: the payload on stdin, extra arguments after `--`, named parameters
   as `-p key=value`, each only if the resource declares it (§8). A file the agent wants to use
   (a `.sql` or a Ruby script) is read by the *client* and sent as content. The broker never opens
-  workspace paths.
-- Outputs are returned to the client. `-o file` is written by the client, inside the guest. The
-  broker never writes into workspace paths.
-- `run` and `wait` wait a bounded time (default 90 s). This matters because agent shell tools have
-  hard timeouts (Claude Code's Bash tool: 2 min default, 10 min max). If the request is still
-  pending, they print its id and exit; the agent continues with `priviledge wait <id>`. A client
-  that exits or disconnects does not cancel its request.
-- A result is kept until a client has received it in full. `wait` on an unknown or
-  already-delivered id fails.
-- Exit status: the resource's own exit status when it ran and its output was released. Otherwise
-  the `sysexits` codes, each with a message on stderr: 75 (`EX_TEMPFAIL`) still pending, 77
-  (`EX_NOPERM`) denied, either the request or the release of its output, with the human's message,
-  69 (`EX_UNAVAILABLE`) broker not connected, 64 (`EX_USAGE`) invalid request (unknown resource,
-  undeclared input, unknown or delivered id). A resource that itself exits with one of these codes
-  is disambiguated by the stderr message.
-- If the human edited the request, the result says so and includes the version that ran. If the
-  human redacted the output, the result says so.
+  workspace paths, and never writes into them: the agent redirects `retrieve`'s stdout where it
+  wants it.
+- `wait` with a timeout exists because agent shell tools have hard timeouts (Claude Code's Bash
+  tool: 2 min default, 10 min max). A timed-out `wait` changes nothing: the agent waits again.
+- A client that exits does not cancel its request. `pending` recovers ids the agent lost.
+- **A result is kept until it has been retrieved completely, then discarded.** Completely means
+  the client wrote the last byte to its stdout without error and reported that to the broker; a
+  broken pipe leaves the result in place for another `retrieve`. An agent that needs a result
+  again keeps its own copy.
+- If the human edited the request, the result says so and includes the version that ran, so the
+  agent does not reason from a query it did not actually get answered. If the human redacted the
+  output, the result says so, so the agent does not take withheld data for absent data. The
+  original request and the unredacted output are never sent; they exist only in the audit log.
+
+**Exit status.** Resource executables never talk to the agent through exit codes (§8), so the
+client's own codes cannot collide with theirs:
+
+| Code | Meaning | Commands |
+|---|---|---|
+| 0 | Success. For `retrieve`: the resource succeeded and its output is on stdout | all |
+| 1 | The resource failed. stdout carries whatever the resource chose to tell the agent | `retrieve` |
+| 250 | Not settled (`retrieve`), or timed out (`wait`) | `wait`, `retrieve` |
+| 251 | Denied: the request, or the release of its output, with the human's message on stderr | `retrieve` |
+| 252 | Unknown id, already retrieved, or already settled (`cancel`) | `wait`, `retrieve`, `cancel` |
+| 253 | Invalid request: unknown resource, undeclared input, missing reason | `request`, `describe` |
+| 254 | Broker not connected | all |
+
+Codes 250–254 are outside the ranges ordinary tools and shells use. Every non-zero exit comes
+with a one-line `priviledge: ...` message on stderr.
 
 **When the broker connection is lost** (guest restarted, broker stopped):
 
 - Requests still **awaiting approval** fail without running.
-- Requests that are **running, awaiting release, or finished but undelivered** may already have
-  had effects (a write on a read-write resource). They are kept, flagged to the human as "not
-  delivered", and the agent can still fetch them with `wait <id>` once the connection is back.
+- Requests that are **running, awaiting release, or settled but not retrieved** may already have
+  had effects (a write on a write resource). They are kept, flagged to the human as "not
+  retrieved", and the agent can still `retrieve` them once the connection is back.
 - If the broker itself restarts, outstanding requests are lost. The audit log (§9) records how far
   each one got.
 
 ## 7. Approval
 
 Each guest has its own approval prompt, on the terminal where the human runs
-`priviledge serve <profile> <name>`, typically in that project's tmux window. The prompt is
-line-oriented, like `git add -p`:
+`priviledge serve <profile> <name>`. The prompt is line-oriented, like `git add -p`:
 
 ```
-[12] trusted/shop · claimed: ~/src/shop-app, claude · prod-db-ro
+[12] trusted/shop · prod-db-ro
      reason: count overdue orders by region
      SELECT region, count(*) FROM orders WHERE status = 'open' GROUP BY region
-run? [y]es [n]o(+msg) [e]dit [v]iew [?]
+run? [y]es [Y]es+release [n]o(+msg) [s]kip [e]dit [v]iew [?]
 [12] exit 0 · 214 lines · 6.1 KB · 1.4 s
      region,count
      eu-west,412
@@ -312,45 +343,46 @@ run? [y]es [n]o(+msg) [e]dit [v]iew [?]
 release? [y]es [n]o(+msg) [v]iew [e]dit/redact
 ```
 
-- The guest (`profile/name`) is established by the broker and is authoritative. Everything the
-  client sends (labels, reason) is shown as claimed.
-- Prompts are answered one at a time, in arrival order. Approved requests run concurrently; their
-  release prompts join the same queue.
+- The guest (`profile/name`) is established by the broker and is authoritative. The reason is the
+  agent's text and is shown as such.
+- **Requests are handled one at a time, in arrival order**: a request runs only after the previous
+  one is settled or skipped. `Y` approves and releases the output without a second prompt, for
+  requests whose result the human does not need to see. `s` leaves a request pending and moves on;
+  it comes back at the end of the queue. Concurrent execution is in the backlog (§10).
 - Requests that need no confirmation still get a one-line entry in the pane, so the human sees
   everything that runs.
-- A bell is emitted on each new prompt (tmux flags the window).
+- The resource's stderr (§8) is shown in the pane and never sent to the guest.
+- Notification of a new prompt is configurable per profile (`notify`, §8): a terminal bell, a
+  command, or nothing.
 - **All agent-supplied text is rendered with control characters escaped.** Requests and outputs
   must not be able to move the cursor, hide lines, restyle the prompt, or send queries to the
   terminal.
 - The inline prompt shows escaped plain text with simple formatting (JSON pretty-printed, CSV
-  aligned).
+  aligned). Output is not size-limited; the prompt shows size and a head/tail preview.
 - `view` opens the content in `$PRIVILEDGE_REVIEW_PAGER`, from a privileged-owned temp file whose
-  extension comes from the resource's `syntax` / `output_syntax` (§8). `edit` does the same with
-  `$PRIVILEDGE_REVIEW_EDITOR`. Both are argv strings, run without a shell.
-  - Default pager: `less` without `-R` and with input preprocessing disabled (`--no-lessopen`).
-    Many systems set `LESSOPEN` to a lesspipe script that runs other programs over the file.
-  - Default editor: `vi`.
-  - Both can point at the same minimal nvim, the pager in read-only mode:
-    `env NVIM_APPNAME=priviledge-review nvim -R`. `NVIM_APPNAME` gives it its own config and plugin
-    directories (`~/.config/priviledge-review/`). `-u <file>` alone is not enough: nvim still loads
-    plugins from the human's normal config and data directories.
-- Output is not size-limited. The prompt shows size and a head/tail preview; `view` shows all of
-  it.
+  extension comes from the resource's `input_syntax` / `output_syntax` (§8). `edit` does the same
+  with `$PRIVILEDGE_REVIEW_EDITOR`. Both are argv strings, run without a shell; the defaults are
+  `less` (without `-R`, and with its input preprocessor disabled) and `vi`. SETUP.md describes safe
+  richer choices.
 
 ### Review surfaces run as privileged over hostile content
 
 Whatever displays a request or output runs on the **privileged side** over **agent-authored**
 text, exactly the content the core rule says privileged tools must not interpret. A painful
-review is itself a risk, because that is where a sneaked-in change gets past a tired reviewer, so
-the review surface should be comfortable **and** minimal:
+review is itself a risk, because that is where a sneaked-in change gets past a tired reviewer.
+Comfortable review and small attack surface pull in opposite directions, and the rule that
+settles it:
 
-- **No LSP, ever.** LSP servers execute project code.
-- **Syntax highlighting is a small, accepted risk.** Highlighters (vim syntax, treesitter) are
-  in-process parsers of untrusted input and have had memory-safety bugs, but they do not execute
-  project code. Acceptable when the review config is privileged-owned and plugin-free, so the AI
-  workspace cannot alter it.
-- **Recommended:** a minimal privileged-owned nvim config with syntax colouring, modelines off
-  (`nomodeline`), no plugins that execute, and no LSP.
+> priviledge itself renders untrusted content only as escaped plain text, with the standard
+> library and no parser beyond JSON and CSV. Any richer view (syntax colour, diffing, folding) is
+> delegated to an external tool the human chooses, which works on a privileged-owned *copy* of the
+> content and must never execute anything from it. priviledge's own surface stays small and
+> auditable; the richer tool's surface is the human's explicit choice.
+
+For those external tools: no LSP, ever (LSP servers execute project code); syntax highlighting is
+a small, accepted risk (in-process parsers of untrusted input, with a history of memory-safety
+bugs, but no code execution) when the tool's configuration is privileged-owned and plugin-free.
+The same rule applies to checkers (§10): external executables, not in-process parsers.
 
 ## 8. Configuration, profiles and resources
 
@@ -366,98 +398,115 @@ confirmation). Guests are not in the file: a guest is an instance of a profile, 
 deployment and named when the broker starts (`priviledge serve <profile> <name>`).
 
 ```toml
-[resource-defaults]
-confirm_request = true
-confirm_output = true
-
 [resources.prod-db-ro]
 description = "Production Postgres (read-only role). Bound queries on large tables by time."
 run = "~/.config/priviledge/resources/prod-db-ro"
 input = "stdin"            # takes a payload: the SQL
-syntax = "sql"
+input_syntax = "sql"
 output_syntax = "csv"
-credential = "read-only"
 
 [resources.prod-db-rw]
 description = "Production Postgres (read-write role)."
 run = "~/.config/priviledge/resources/prod-db-rw"
 input = "stdin"
-syntax = "sql"
+input_syntax = "sql"
 output_syntax = "csv"
-credential = "read-write"
+write_credential = true
 
 [resources.aws-readonly]
 description = "AWS CLI with the read-only role. Pass the aws arguments after --."
 run = "~/.config/priviledge/resources/aws-readonly"
 args = true
 output_syntax = "json"
-credential = "read-only"
+
+[resources.dashboard-query]
+kind = "human"
+description = "A query for the human to run in the monitoring dashboard. Payload: the query."
+input = "stdin"
+input_syntax = "json"
+output_syntax = "json"
 
 [profiles.trusted]
-channel = ["docker", "exec", "-i", "aiws-{profile}-{name}"]
-resources = ["prod-db-ro", "prod-db-rw", "aws-readonly"]
-[profiles.trusted.resource-overrides.prod-db-ro]
-confirm_request = false    # allowed: the resource's credential is read-only
-confirm_output = false
-[profiles.trusted.resource-overrides.aws-readonly]
-confirm_request = false
+guest_exec = ["docker", "exec", "-i", "aiws-{profile}-{name}"]
+notify = "bell"
+[profiles.trusted.resources]
+prod-db-ro = { confirm_request = false, confirm_output = false }
+prod-db-rw = {}
+aws-readonly = { confirm_request = false }
+dashboard-query = {}
 
 [profiles.public]
-channel = ["docker", "exec", "-i", "aiws-{profile}-{name}"]
-resources = ["prod-db-ro", "aws-readonly"]
-# no overrides: every request and every output is confirmed
+guest_exec = ["docker", "exec", "-i", "aiws-{profile}-{name}"]
+notify = "bell"
+[profiles.public.resources]
+prod-db-ro = {}            # every request and every output is confirmed
+aws-readonly = {}
 
-[profiles.hostile-web]
-resources = []             # no broker is needed for such guests
-
+[profiles.hostile-web]     # no resources: no broker runs for such guests
 [profiles.hostile-sample]
-resources = []
 ```
 
 ### Resolution
 
-The settings that apply to a resource in a guest are, in order: `[resource-defaults]`, then the
-guest's profile `resource-overrides` for that resource. Scalars override; there is nothing to
-merge deeper. The broker validates the merged result at start:
+A resource is available to a guest if it appears in its profile's `resources` table; the value
+holds that profile's settings for it. `confirm_request` and `confirm_output` default to `true`.
+The broker validates at start:
 
-- `confirm_request = false` is only allowed when the resource's `credential = "read-only"`.
-  Otherwise writes would run unapproved. Releasing output unreviewed is a confidentiality choice
-  and is allowed for any resource.
-- An override for a resource the profile does not list is an error.
-- `channel` must contain `{name}` (and may contain `{profile}`), so that two guests of one profile
-  cannot resolve to the same channel.
+- `confirm_request = false` is only allowed for resources without `write_credential`. Otherwise
+  writes would run unapproved. Releasing output unreviewed is a confidentiality choice and is
+  allowed for any resource.
+- A profile entry for a resource that does not exist is an error.
+- `guest_exec` must contain `{name}` (and may contain `{profile}`), so that two guests of one
+  profile cannot resolve to the same command.
 
 ### Profile fields
 
 | Field | Meaning |
 |---|---|
-| `channel` | The channel command (§4) as an argv list, with `{profile}` and `{name}` substituted. Required for any profile with resources |
-| `resources` | The resources guests of this profile may list and request. Others don't exist for them |
-| `resource-overrides.<resource>` | `confirm_request` / `confirm_output` for that resource in this profile |
+| `guest_exec` | The command that runs a program inside a guest (§4, item 2), as an argv list with `{profile}` and `{name}` substituted; priviledge appends its own program name and arguments. Required for a profile with resources |
+| `notify` | `"bell"`, `"none"`, or an argv list to run on each new prompt. Default `"bell"` |
+| `resources.<resource>` | Makes the resource available to guests of this profile. Keys: `confirm_request` (approve before running), `confirm_output` (approve before releasing the output); both default `true` |
+
+Whether to trust a resource unattended is a property of the profile, not of the resource, which
+is why the confirmation settings live here.
 
 ### Resource fields
 
 | Field | Meaning |
 |---|---|
+| `kind` | `"exec"` (default) or `"human"` |
 | `description` | Shown to the agent by `list`/`describe` and to the human in the prompt |
-| `run` | The privileged-owned executable |
+| `run` | The privileged-owned executable (`exec` only) |
 | `input` | `"stdin"` if the resource takes a payload. Omitted: no payload accepted |
-| `args` | `true` if extra arguments after `--` are passed as argv. Default `false` |
+| `args` | `true` if extra arguments after `--` are passed as argv (`exec` only). Default `false` |
 | `params` | Table of named parameters and their descriptions. Undeclared parameters are rejected |
-| `syntax`, `output_syntax` | Review hints: the file extension used for `view`/`edit` |
-| `credential` | `"read-only"` or `"read-write"`: the human's declaration of what the credential enforces |
+| `input_syntax`, `output_syntax` | Review hints: the file extension used for `view`/`edit` |
+| `write_credential` | `true` if the resource's credential can change state. Default `false`. The human's declaration of what the credential enforces |
 
-`confirm_request` and `confirm_output` (default `true`: approve before running / before releasing
-the output) are set in `[resource-defaults]` and per profile, never on the resource itself:
-whether to trust a resource unattended is a property of the profile, not of the resource.
+### The resource contract
+
+A resource has one audience on each side, and the broker keeps them apart:
+
+- **stdout is for the agent.** Whatever the resource writes there is the result, released to the
+  guest after review (or at once, if the profile says so).
+- **stderr is for the human.** Diagnostics, the wrapped tool's own errors, anything that mentions
+  hosts, users or paths. It is shown in the approval pane and written to the audit log, and never
+  sent to the guest.
+- **Exit 0 is success; any other status is failure.** The status itself is not forwarded. A
+  resource that wants the agent to know *why* it failed writes that to stdout before exiting
+  ("syntax error at line 3"), and leaves out what the agent has no business knowing ("connection
+  refused to prod-db-3.internal").
+
+Resource executables are therefore wrappers written for this contract, not stock tools exposed
+directly. They may be shared, and priviledge may ship some, but each one is the human's choice.
 
 ### Exec resources
 
-A resource is an executable owned by the privileged user. It is executed directly (never through
-`sh -c`). It receives the payload on stdin, declared parameters as `PRIVILEDGE_P_<NAME>` environment
-variables, and, if `args = true`, the extra arguments as argv. The agent cannot set any other part
-of its environment. It fetches its own secrets with whatever the OS provides (macOS `security`,
-Linux `secret-tool`, `pass`, `op read`, ...).
+An `exec` resource is an executable owned by the privileged user. It is executed directly (never
+through `sh -c`). It receives the payload on stdin, declared parameters as `PRIVILEDGE_P_<NAME>`
+environment variables, and, if `args = true`, the extra arguments as argv. The agent cannot set
+any other part of its environment. It fetches its own secrets with whatever the OS provides (macOS
+`security`, Linux `secret-tool`, `pass`, `op read`, ...).
 
 Resource executables must reference only privileged-owned files. A script taken from a project
 (for example a repo's `bin/console`) is used from a privileged clean clone at a reviewed
@@ -499,7 +548,7 @@ requests as reads or writes, so they don't conflict with §5.
 # aws-readonly: aws with only the read-only profile reachable, and no `configure`.
 # Global options may precede the subcommand, so check every argument.
 for a in "$@"; do
-  [ "$a" = configure ] && { echo "aws configure is not allowed" >&2; exit 77; }
+  [ "$a" = configure ] && { echo "aws configure is not allowed"; exit 1; }
 done
 export AWS_CONFIG_FILE=~/.config/priviledge/aws/readonly.config
 export AWS_SHARED_CREDENTIALS_FILE=~/.config/priviledge/aws/readonly.credentials
@@ -508,7 +557,8 @@ exec aws "$@"
 
 ```sh
 #!/bin/sh
-# prod-db-ro: `sqlquery` is the human's driver-based script: SQL in on stdin, CSV out.
+# prod-db-ro: `sqlquery` is the human's driver-based script: SQL in on stdin, CSV out,
+# and the driver's own errors on stderr, for the human.
 PGPASSWORD=$(security find-generic-password -s prod-db-ro -w) \
   exec ~/.config/priviledge/bin/sqlquery "host=... user=app_ro dbname=... options='-c statement_timeout=60s'"
 ```
@@ -519,7 +569,20 @@ auto-approved query can still load production. Bound the cost with a role-level 
 
 `args = true` on a broad credential should come with `confirm_request = true` in every profile.
 
-### Session resources (later)
+### Human resources
+
+A `human` resource is a task only the human can do, fast, without ending the agent's turn:
+running a query in a browser console, reading a value off a dashboard, answering a question.
+The agent's alternative is to stop and ask, which tends to make it summarise, draw conclusions
+and act as if the turn were over, when the missing information may change those conclusions.
+
+The request is shown like any other, with the payload as the task. On `y` the broker opens
+`$PRIVILEDGE_REVIEW_EDITOR` on an empty privileged-owned temp file; what the human saves is the
+result (stdout, in the contract above). `n` denies. `confirm_output` applies as for any resource
+and defaults to `true`, although the human wrote the output; setting it to `false` skips the second
+look.
+
+### Session resources (backlog)
 
 Long-lived interactive processes: psql, a Django shell reached through a cloud exec
 shell, a remote ssh shell. Essential in practice (slow start-up, loaded state,
@@ -532,34 +595,50 @@ and safe.
 ## 9. Audit log
 
 Every request is recorded on the privileged side, one log per guest: request id, guest
-(`profile/name`), claimed labels, reason, the request (and the edited version, if any),
-decisions, timestamps, exit status, output size and a hash of the output. Output bodies are not
-logged by default. Each step of a request (received, decided, started, finished, released,
-delivered) is recorded as it happens, so a crash leaves a record of how far every request got.
+(`profile/name`), reason, the request as submitted and as run (if edited), decisions,
+timestamps, exit status, the resource's stderr, output size and a hash of the output, and the
+unredacted output when the released one was redacted. Output bodies are not logged otherwise.
+Each step of a request (received, decided, started, finished, released, retrieved) is recorded as
+it happens, so a crash leaves a record of how far every request got.
 
-## 10. Scope
+## 10. Backlog
 
-**v1:** exec resources; profiles; `list`, `describe`, `run`, `wait`; the approval prompt with both
-confirmation flags and output review; the audit log.
+Development is iterative: after each item ships, the next one is chosen. The order below is the
+current intent, not a plan. Releases use semantic versioning, `0.x` while the interfaces in this
+document may still change, `1.0` when they stop.
 
-**Later**, in rough order:
-
-- Session resources (§8).
-- A notification hook (`on_request`: run a command for richer notifications than the bell).
-- Burst approvals: "approve the rest from this resource for N minutes", read-only resources only.
-- A privileged-only approval interface for scripting (`pending`, `approve`, `deny`).
-- SaaS write resources (issue tracker, team chat).
-- **Egress approval**: the deployment's egress proxy asks priviledge before allowing a new host,
-  so the human approves domains the way they approve requests.
-- A git credential helper backed by priviledge, removing the last native token (§5).
-- An MCP adapter (`priviledge mcp`, exposing only `tools/list` and `tools/call`), only if a client
-  needs it and it shows value over its cost. The CLI is POSIX-composable
-  (`priviledge run ... | grep`), works in every agent, and keeps the surface small and free of MCP
-  spec churn.
+1. **The core**: exec resources, profiles, the client (`list`, `describe`, `request`, `wait`,
+   `retrieve`, `pending`, `cancel`), the sequential approval prompt with both confirmations and
+   output review, the audit log.
+2. **Human resources** (§8).
+3. **Checkers**: privileged-owned executables that receive a request before the prompt and return
+   *pass*, *flag* (with a note the prompt shows) or *block*. Pattern rules first; other kinds
+   possible. They follow the review-surface rule (§7) and the resource input rules (§8).
+4. **Concurrent execution**: several approved requests running at once, with their release
+   prompts queued. Needs its own UX pass.
+5. **Session resources** (§8).
+6. **Egress approval**: the deployment's egress proxy asks priviledge before allowing a new host,
+   so the human approves domains the way they approve requests.
+7. **MCP servers on the privileged side.** Some integrations exist only as MCP servers. The broker
+   runs them, with their credentials, and the client exposes them to the guest through a stdio
+   adapter that forwards only `tools/list` and `tools/call`; each call is a request with the
+   profile's confirmation settings, per tool. The server processes agent input with a credential,
+   so it runs confined, like any resource that does.
+8. **HTTP resources**: `kind = "http"` with a fixed base URL, allowed methods and paths, a
+   credential injected on the privileged side, and JSON review hints. Most SaaS reads,
+   declaratively; the fixed base URL satisfies the credential rules by construction.
+9. **A git credential helper backed by priviledge**, removing the last native token (§5).
+10. **Burst approvals**: "approve the rest from this resource for N minutes", read-only resources
+    only.
+11. **A privileged-only approval interface for scripting** (`pending`, `approve`, `deny`).
+12. **An MCP adapter for the client's own commands** (`priviledge mcp`), only if a client needs
+    it and it shows value over its cost. The CLI is POSIX-composable, works in every agent, and
+    keeps the surface small and free of MCP spec churn.
 
 ## 11. Open questions
 
 - Which SaaS tokens can actually be scoped read-only (trackers, code hosts, chat) **(verify)**.
 - Cancelling a running request from the approval prompt, and whether resources need a timeout.
 - Head/tail preview size in the approval prompt.
-- Whether requests should survive a broker restart. In v1 they don't; the audit log is the record.
+- Whether requests should survive a broker restart. For now they don't; the audit log is the
+  record.

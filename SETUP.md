@@ -2,8 +2,8 @@
 
 Status: draft. This describes **one** way to deploy the AI workspace around priviledge: Docker
 containers on macOS. priviledge itself does not depend on it; it only needs the deployment contract
-in [SPEC.md §4](SPEC.md#4-deployment-contract); how priviledge uses the channel is in
-[DESIGN.md §3](DESIGN.md#3-channel-and-relay). Other setups are sketched in §11. Items marked
+in [SPEC.md §4](SPEC.md#4-deployment-contract); how priviledge reaches a guest is in
+[DESIGN.md §3](DESIGN.md#3-channel-and-relay). Other setups are sketched in §13. Items marked
 **(verify)** must be checked on the real machine. Every command here changes the machine's
 configuration, so the human reviews and runs it.
 
@@ -35,7 +35,7 @@ host: privileged side                            Docker VM
   Guests are separated from each other by kernel namespaces inside that VM, which is weaker but
   adequate for project-vs-project trust.
 - The privileged side drives guests only through the runtime's CLI, and never runs code written in
-  a guest except reviewed code at a pinned commit (§9, §10).
+  a guest except reviewed code at a pinned commit (§10, §11).
 
 ## 2. Container runtime
 
@@ -47,7 +47,7 @@ needs `exec -i`.
   Podman are free. OrbStack is paid for commercial use.
 - **File sharing:** restrict the runtime's shared host paths to what containers actually mount:
   the dotfiles and exchange directories (§4), and the clean-clone paths that project compose files
-  bind-mount (§9). Not all of `/Users`. If a guest escaped into the runtime's VM, it would reach
+  bind-mount (§10). Not all of `/Users`. If a guest escaped into the runtime's VM, it would reach
   whatever the VM can see, including those clean clones. **(verify)** that Docker Desktop allows
   removing the default paths.
 - **Never** give a guest the runtime's control socket (`/var/run/docker.sock` or equivalent),
@@ -117,7 +117,7 @@ esac
 
 - **Repos live in the guest's home volume**, not on the host filesystem. The privileged side can't
   accidentally run git or an editor against them; it reaches them only through the `ext::` remote
-  (§9).
+  (§10).
 - **Dotfiles are mounted read-only**: nvim config, shell config, git config (no credentials), the
   global gitignore, Claude Code's global instructions. Change them once on the host and every guest
   sees it. Inside the guest, link them into place once (`ln -s ~/.dotfiles/nvim ~/.config/nvim`).
@@ -132,7 +132,7 @@ esac
 - **Published ports** are bound to `127.0.0.1` and chosen per guest (`AIWS_PORT`) to avoid
   clashes. Dev servers must listen on `0.0.0.0` *inside* the guest for the published port to reach
   them (Django's dev server, for one, defaults to `127.0.0.1`). Published ports are also reachable
-  from other guests (§10), so the per-guest network only isolates unpublished ports.
+  from other guests (§11), so the per-guest network only isolates unpublished ports.
 - `hostile-web` uses the default bridge: no proxy, no allow-list, and no credentials to protect.
   Its published port is still bound to loopback; drop `-p` if nothing needs the browser.
 
@@ -197,7 +197,7 @@ Notes:
 - Apple `container` (macOS 26) has a blocklist but no egress allow-list yet **(verify)**; the
   proxy pattern above still works there with a sidecar.
 - Denied hosts are logged by the proxy; reviewing that log is how allow-lists grow. Approval of new
-  hosts through priviledge is a later feature (SPEC.md §10).
+  hosts through priviledge is in the backlog (SPEC.md §10).
 
 ## 6. Image
 
@@ -227,7 +227,7 @@ WORKDIR /home/aiws
 - No sudo in the guest; `cap_drop` and `no-new-privileges` would defeat it anyway. Installing
   system packages means rebuilding the image from the privileged side.
 - The guest's copy of priviledge is only the client and relay, and must be on the default `PATH`
-  (the channel command runs it without a login shell). Its integrity doesn't matter; it only has
+  (`guest_exec` runs it without a login shell). Its integrity doesn't matter; it only has
   to speak a protocol version the broker accepts (DESIGN.md §4).
 - The broker's copy is what matters (SPEC.md §3): install it on the host from a privileged-owned
   clean clone at a reviewed tag, never from a guest.
@@ -269,10 +269,33 @@ tmux split-window -v "priviledge serve $p $n"       # approvals for this guest
   output, which is why clipboard reads are denied and priviledge escapes agent text.
 - The terminal's `TERM` (`xterm-ghostty`, say) needs its terminfo in the image. Either
   install it or use `xterm-256color`, as in §4.
-- A privileged window holds a shell in the clean clones (§9) for review, push, deploy and project
+- A privileged window holds a shell in the clean clones (§10) for review, push, deploy and project
   compose.
 
-## 8. Editor, LSP and agent (inside the guest)
+## 8. Review tools (privileged side)
+
+The approval prompt shows escaped plain text; any richer view comes from the pager and editor the
+human configures (SPEC.md §7). They run as the privileged user over agent-authored content, so the
+choice matters:
+
+- `$PRIVILEDGE_REVIEW_PAGER` and `$PRIVILEDGE_REVIEW_EDITOR` are argv strings, run without a shell.
+- The default pager is `less` without `-R` and with `--no-lessopen`. Many systems set `LESSOPEN` to
+  a lesspipe script that runs other programs over the file.
+- A minimal nvim serves as both, the pager in read-only mode:
+
+  ```
+  PRIVILEDGE_REVIEW_PAGER="env NVIM_APPNAME=priviledge-review nvim -R"
+  PRIVILEDGE_REVIEW_EDITOR="env NVIM_APPNAME=priviledge-review nvim"
+  ```
+
+  `NVIM_APPNAME` gives it its own configuration and plugin directories
+  (`~/.config/priviledge-review/`, privileged-owned). `-u <file>` alone is not enough: nvim still
+  loads plugins from the normal configuration and data directories. In that configuration: syntax
+  colouring (vim syntax or treesitter), `set nomodeline`, no plugins that execute anything, no LSP.
+- Human resources (SPEC.md §8) open the same editor on an empty file for the answer.
+- Diff review before a push uses a git tool that does not run project code (§10).
+
+## 9. Editor, LSP and agent (inside the guest)
 
 - nvim, its plugins and every LSP server run in the guest: ruby-lsp, typescript-language-server,
   basedpyright/pyright, lua_ls, and so on. The plugin manager and mason.nvim install into the home
@@ -283,7 +306,8 @@ tmux split-window -v "priviledge serve $p $n"       # approvals for this guest
   `CLAUDE.md` is linked from the read-only dotfiles, so the source stays intact on the host. The
   agent could still replace the link in its own home; instructions are not a security control
   (SPEC.md §3). Its permission allow-list includes `Bash(priviledge list)`,
-  `Bash(priviledge describe:*)`, `Bash(priviledge run:*)` and `Bash(priviledge wait:*)`.
+  `Bash(priviledge describe:*)`, `Bash(priviledge request:*)`, `Bash(priviledge wait:*)`,
+  `Bash(priviledge retrieve:*)`, `Bash(priviledge pending)` and `Bash(priviledge cancel:*)`.
 - Browser automation (Playwright and similar) runs inside the guest as well. Chromium's own
   sandbox may not start with all capabilities dropped; Playwright then needs Chromium's
   `--no-sandbox`, leaving the guest as the boundary **(verify)**.
@@ -293,13 +317,13 @@ tmux split-window -v "priviledge serve $p $n"       # approvals for this guest
 - Per-path tool state (Claude Code's per-project memory, `mise trust`, `direnv allow`) initialises
   fresh in the guest. Existing checkouts are not migrated; clone fresh.
 
-## 9. Git: clone, review, push, deploy
+## 10. Git: clone, review, push, deploy
 
 **In the guest:** clone with a **read-only** upstream token (HTTPS, stored in the guest's git
 credential store). Fetch and pull work; push is rejected by the server.
 
 **On the privileged side:** a clean clone per repo, with the guest as a remote through git's
-`ext::` transport, which runs git's protocol over the channel command:
+`ext::` transport, which runs git's protocol over the same command `guest_exec` uses:
 
 ```sh
 git clone git@git.example.com:org/shop-app.git ~/src-clean/shop-app
@@ -339,7 +363,7 @@ git worktree add ../shop-app-deploy <reviewed-sha>         # deploys and tofu ru
 Deploying runs code written in the guest with privileges. That is the reviewed-code exception of
 SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
 
-## 10. Dev services and dev servers
+## 11. Dev services and dev servers
 
 - The human runs each project's compose from the clean clone at a reviewed commit, so review
   covers its mounts, privileges and build contexts.
@@ -371,7 +395,7 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
   holding real sessions.
 - Dev databases that matter get snapshots or credentials: the guest can reach them.
 
-## 11. Host exposure and hygiene
+## 12. Host exposure and hygiene
 
 - **Host loopback.** On Docker Desktop, containers on a normal network can reach services
   listening on the host's loopback through `host.docker.internal` **(verify)**. That includes
@@ -386,11 +410,11 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
 - **The global gitignore** must reach guests through the dotfiles. Otherwise personal files
   ignored only by the host's global ignore become committable.
 
-## 12. Other setups
+## 13. Other setups
 
-The same priviledge configuration works with a different `channel` template per profile:
+The same priviledge configuration works with a different `guest_exec` template per profile:
 
-| Setup | Channel | Notes |
+| Setup | `guest_exec` | Notes |
 |---|---|---|
 | Docker / colima / Podman (this document) | `docker exec -i aiws-{profile}-{name}` | VM boundary to the host on macOS |
 | Apple `container` (macOS 26) | `container exec -i aiws-{profile}-{name}` **(verify)** | One lightweight VM per container: a VM boundary between guests too. Same OCI images. No egress allow-list yet (§5) |
@@ -406,16 +430,17 @@ or Podman, a sandboxed runtime (gVisor, Kata), or VMs.
 home to them (`chmod o-rwx ~`; they are not in the privileged user's group), and give each its own
 toolchains. For interactive panes, prefer `ssh` to loopback over `sudo -u`/`su`: on macOS `su`
 does not allocate a new terminal, so the guest shell shares the privileged pane's terminal device.
-The channel has no terminal (the broker starts it detached, DESIGN.md §3), so `sudo -u` is fine
-there. For ssh: key-only logins restricted to `AllowUsers <user>@127.0.0.1 <user>@::1`, no
-forwarding of any kind, and a dedicated key installed with `restrict,pty` (on macOS, launchd
-starts sshd on all interfaces and may ignore `ListenAddress` **(verify)**). Never give such a user
+The broker's connection has no terminal (it starts `guest_exec` detached, DESIGN.md §3), so
+`sudo -u` is fine there. For ssh: key-only logins restricted to
+`AllowUsers <user>@127.0.0.1 <user>@::1`, no forwarding of any kind, and a dedicated key installed
+with `restrict,pty` (on macOS, launchd starts sshd on all interfaces and may ignore
+`ListenAddress` **(verify)**). Never give such a user
 sudo to the privileged account, including for Homebrew: sudo would authenticate the guest's own
 password, which other guest processes can capture, and brew run as its owner with guest-influenced
 input is equivalent to a shell as the owner. Egress per user needs a packet filter rule keyed on
 uid (`pf` on macOS, nftables on Linux) **(verify)**.
 
-## 13. Verification checklist
+## 14. Verification checklist
 
 From inside a `trusted` or `public` guest:
 
@@ -427,7 +452,7 @@ From inside a `trusted` or `public` guest:
 - `curl https://example.com` fails (not allow-listed); `curl https://<allowed host>` works;
   `curl http://host.docker.internal:<port>` fails.
 - `priviledge list` shows only this profile's resources. Stopping the guest's `priviledge serve`
-  makes `run` fail fast.
+  makes `request` fail fast.
 
 From inside a `hostile-sample` guest: no network at all (`getent hosts example.com` fails).
 
