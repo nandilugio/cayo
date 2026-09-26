@@ -4,8 +4,8 @@ Status: draft proposal. Nothing here is implemented yet. Items marked **(verify)
 that must be checked on a real machine before they are relied upon.
 
 This document describes **how** priviledge is built to meet [SPEC.md](SPEC.md). The spec is the
-contract; anything here can change as long as the spec still holds. Terms (guest, privileged
-side, broker) are as defined in [SPEC.md §3](SPEC.md#3-threat-model).
+contract; anything here can change as long as the spec still holds. Terms (guest, profile,
+privileged side, broker) are as defined in [SPEC.md §3](SPEC.md#3-threat-model).
 
 ## 1. Processes
 
@@ -13,27 +13,45 @@ One program, `priviledge`, with subcommands:
 
 | Subcommand | Runs on | Role |
 |---|---|---|
-| `serve <guest>` | privileged side | The broker for one guest: reads the configuration, opens the channel into the guest and supervises the relay, runs resources, hosts the approval prompt on its terminal, writes the audit log |
+| `serve <profile> <name>` | privileged side | The broker for one guest: reads the configuration, resolves the profile, opens the channel into the guest and supervises the relay, runs resources, hosts the approval prompt on its terminal, writes the audit log |
 | `relay` | guest | Started by the broker through the channel command, never by hand. Listens on a Unix socket inside the guest and forwards between clients and the broker |
 | `list`, `describe`, `run`, `wait` | guest | Clients (SPEC.md §6). Each call connects to the relay's socket |
 
 **One broker per guest.** Each broker has one channel, so every message it receives belongs to
-that guest, and each guest gets its own approval pane.
+that guest, and each guest gets its own approval pane. The guest is identified everywhere
+(prompt, audit log) as `<profile>/<name>`.
 
 Resources run as child processes of the broker, in their own session without a controlling
 terminal, with stdin, stdout and stderr connected to the request. They can't prompt on, or write
 to, the approval pane.
 
-## 2. Channel and relay
+## 2. Configuration resolution
+
+At start, `serve <profile> <name>`:
+
+1. Loads `config.toml` (SPEC.md §8) after checking ownership and permissions.
+2. Substitutes `{profile}` and `{name}` in the profile's `channel`. `name` must match
+   `[A-Za-z0-9][A-Za-z0-9._-]*`, so it cannot alter the command's shape.
+3. Builds the guest's resource table: for each resource in the profile's `resources`, the resource
+   definition plus `confirm_request`/`confirm_output` from `[resource-defaults]` overridden by the
+   profile's `resource-overrides`. Overrides for unlisted resources, and `confirm_request = false`
+   on a resource whose `credential` is not `read-only`, are start-up errors.
+4. Refuses to start if the profile has no resources: such a guest has nothing to request, so
+   there is nothing to broker.
+
+`list` and `describe` answer from this table only; a request for anything else is an invalid
+request (exit 64).
+
+## 3. Channel and relay
 
 ```
-privileged side                                  guest "aiws-shop"
+privileged side                                  guest trusted/shop
 ┌──────────────┐  channel command            ┌──────────────────────────┐
-│ priviledge    │  (docker exec -i aiws-shop  │ priviledge relay          │
-│ serve        │ ────── priviledge relay) ──▶ │   listens on a Unix      │
-│ aiws-shop    │ ◀───── stdin/stdout ──────▶ │   socket in the guest    │
-└──────────────┘                             │          ▲               │
-                                             │ priviledge run ... ───────┘
+│ priviledge    │  (docker exec -i            │ priviledge relay          │
+│ serve        │   aiws-trusted-shop         │   listens on a Unix      │
+│ trusted shop │ ────── priviledge relay) ──▶ │   socket in the guest    │
+│              │ ◀───── stdin/stdout ──────▶ │          ▲               │
+└──────────────┘                             │ priviledge run ... ───────┘
                                              └──────────────────────────┘
 ```
 
@@ -44,9 +62,9 @@ mounted into a container, because sockets don't cross the hypervisor. The relay 
 connects: the broker dials *into* the guest with a command only it controls, so it knows who is on
 the other end because it chose the destination. This meets SPEC.md §3's identity requirement with
 no secrets and no host listener. Replacing the relay binary gains a guest nothing: whatever speaks
-on aiws-shop's channel *is* aiws-shop.
+on this guest's channel *is* this guest.
 
-- On start, `serve <guest>` runs the guest's `channel` command followed by `priviledge relay`, and
+- On start, the broker runs the resolved `channel` command followed by `priviledge relay`, and
   keeps that process's stdin and stdout as the channel. Nothing listens on the host.
 - The channel process is started in a new session with no controlling terminal (`setsid`), and
   its stderr is captured rather than inherited. Otherwise, with a channel like `sudo -u aiws`, a
@@ -66,7 +84,7 @@ on aiws-shop's channel *is* aiws-shop.
 - Everything arriving on the channel is untrusted input from that guest. The broker validates
   every message and never trusts a claim of identity in it.
 
-## 3. Handshake and liveness
+## 4. Handshake and liveness
 
 - **Handshake.** The first line in each direction is a `hello` carrying the protocol version. The
   guest's copy of priviledge is independent of the broker's (SPEC.md §3), so versions will drift;
@@ -84,23 +102,23 @@ on aiws-shop's channel *is* aiws-shop.
   its own (same inode); once it isn't, it tells its broker it was taken over and exits, and that
   broker reports "another broker took over this guest" in its pane instead of reconnecting. An
   orphaned relay with no broker exits when its heartbeat lapses. On exit a relay removes the
-  socket only if it is still its own. Refusing instead would
-  let an orphaned relay lock a restarted broker out of its guest. Takeover grants nothing to the
-  guest: any process in it could already answer on the socket, and results are only as
-  trustworthy to clients as the guest itself (SPEC.md §3).
+  socket only if it is still its own. Refusing instead would let an orphaned relay lock a
+  restarted broker out of its guest. Takeover grants nothing to the guest: any process in it could
+  already answer on the socket, and results are only as trustworthy to clients as the guest
+  itself (SPEC.md §3).
 
-## 4. Requests and channel loss
+## 5. Requests and channel loss
 
 Requests live in the broker's memory, keyed by id. A request is dropped once its result has been
 sent in full on some connection (SPEC.md §6); ids are not reused.
 
-When the channel ends, the broker marks the guest offline, applies the rules in SPEC.md §6 (unapproved requests fail; requests that ran are
-kept as "not delivered" until fetched with `wait`), and restarts the channel with backoff. When
-the relay's stdin closes or its heartbeat lapses, it removes its socket and exits, so clients fail
-fast with "broker not connected". A broker restart loses the in-memory requests; the audit log
-(§7) is the record.
+When the channel ends, the broker marks the guest offline, applies the rules in SPEC.md §6
+(unapproved requests fail; requests that ran are kept as "not delivered" until fetched with
+`wait`), and restarts the channel with backoff. When the relay's stdin closes or its heartbeat
+lapses, it removes its socket and exits, so clients fail fast with "broker not connected". A
+broker restart loses the in-memory requests; the audit log (§8) is the record.
 
-## 5. Framing
+## 6. Framing
 
 - **Client ↔ relay:** newline-delimited JSON, one request per connection. The client sends one
   request (`run`, `wait`, `list`, `describe`) and reads events (`pending`, `chunk`, `result`,
@@ -117,22 +135,22 @@ fast with "broker not connected". A broker restart loses the in-memory requests;
 - **Line limit.** A line longer than 1 MiB is a protocol error: the relay drops that client's
   connection, and the broker drops that connection id. Neither needs unbounded buffers.
 
-## 6. Other transports
+## 7. Other transports
 
 A host-side TCP listener is a possible later transport for hosts that offer networking but no
 channel command. It would need a per-guest secret to identify callers and protection against
 other guests on the same network sniffing or spoofing it (network isolation or TLS). Not in v1.
 
-## 7. Files
+## 8. Files
 
 - Config and state follow the **XDG Base Directory** spec on the privileged side:
   `$XDG_CONFIG_HOME/priviledge` (config, SPEC.md §8), `$XDG_STATE_HOME/priviledge` (audit logs).
-- Audit log: `$XDG_STATE_HOME/priviledge/<guest>.jsonl`, one JSON line per request step, each
-  carrying the request id (SPEC.md §9).
+- Audit log: `$XDG_STATE_HOME/priviledge/<profile>-<name>.jsonl`, one JSON line per request step,
+  each carrying the request id (SPEC.md §9).
 - Review temp files (SPEC.md §7) are created in a privileged-owned directory with mode 0700 and
   removed after use.
 
-## 8. Technology
+## 9. Technology
 
 - **Language: Python**, with a **pinned runtime shipped via uv** (a uv-managed interpreter, or a
   bundle via shiv/pex), so there is no dependency on the stock system Python and no version matrix
@@ -145,32 +163,34 @@ other guests on the same network sniffing or spoofing it (network isolation or T
   security-critical logic is process and permission handling, not parsing. A Rust rewrite fits as
   a "once the design stops changing" step.
 
-## 9. Session resources (later)
+## 10. Session resources (later)
 
 A sketch for SPEC.md §8's session resources: the broker holds the process on a pty, the human sees
 it start in the approval pane and completes any interactive authentication there, each approved
 snippet is written to the session followed by a sentinel, and output is captured up to the
 sentinel. It also needs handling for output interleaved with prompts, keepalive, and
 cancellation. Local clients such as psql would run confined, per SPEC.md §8's input
-rules. Details are open (§11).
+rules. Details are open (§12).
 
-## 10. Implementation plan
+## 11. Implementation plan
 
-1. **Environment first** ([SETUP.md](SETUP.md)): the guest runtime, the base image, one project
-   guest, the tmux layout, and the verification checklist. Building the rest *inside* the real
-   boundary surfaces the true frictions (timeouts, round-trips, approval bursts) instead of
-   guessing them.
-2. **Core loop:** `serve` with the channel and relay, exec resources, the approval prompt with the
-   confirmation flags and output review, `run`/`wait`/`list`/`describe`, and the audit log. Try
-   it against a local dev database and a read-only cloud command.
+1. **Environment first** ([SETUP.md](SETUP.md)): the guest runtime, the profile images, one
+   `trusted` guest, egress for it, the tmux layout, and the verification checklist. Building the
+   rest *inside* the real boundary surfaces the true frictions (timeouts, round-trips, approval
+   bursts) instead of guessing them.
+2. **Core loop:** `serve` with configuration resolution, the channel and relay, exec resources,
+   the approval prompt with the confirmation flags and output review,
+   `run`/`wait`/`list`/`describe`, and the audit log. Try it against a local dev database and a
+   read-only cloud command.
 3. **Git and deploy flow** (SETUP.md): clean clones, the `ext::` remote, push and deploy from a
    reviewed commit.
-4. **The "later" items of SPEC.md §10**, starting with session resources: psql first,
+4. **A `public` guest**, to exercise a second profile against the same project.
+5. **The "later" items of SPEC.md §10**, starting with session resources: psql first,
    then a Django shell through a cloud exec shell.
 
-## 11. Open questions
+## 12. Open questions
 
-- Whether a request payload needs a total size cap (lines are already bounded, §5).
+- Whether a request payload needs a total size cap (lines are already bounded, §6).
 - Heartbeat and timeout defaults (10 s / 30 s) are guesses to tune in use.
 - **(verify)** what the relay sees when `serve` is killed hard, per runtime (end-of-file or
   nothing). The heartbeat covers both, but it tells us how long orphans linger.
