@@ -403,26 +403,65 @@ privileged side                                  guest "aiws-shop"
 
 - On start, `serve <guest>` runs the guest's `channel` command followed by `priviledge relay`, and
   keeps that process's stdin and stdout as the channel. Nothing listens on the host.
+- The relay runs as whichever user the channel command lands on, and clients must run as that
+  same user to reach its socket. With `docker exec -i` that is the image's default user; a
+  channel that switches user (e.g. `-u 0`) would create a socket the guest's normal user cannot
+  use.
 - The relay listens on `$PRIVILEDGE_SOCKET`, default `$XDG_STATE_HOME/priviledge/relay.sock` (i.e.
   `~/.local/state/priviledge/relay.sock`, directory mode 0700). The default depends only on the
-  home directory, so the relay and the clients agree on it however each was started.
-- The relay removes a stale socket file at start. If another relay answers on the socket, it
-  refuses to start, and `serve` reports that a broker is already connected to this guest.
-- If the channel ends (guest stopped, relay killed), the broker marks the guest offline, fails its
-  pending requests, and restarts the channel with backoff. When the relay's stdin closes (broker
-  gone), it removes its socket and exits, so clients fail fast.
+  home directory, so the relay and the clients agree on it however each was started. Unix socket
+  paths are limited to about 100 bytes (103 on macOS, 107 on Linux); the relay fails with a clear
+  message if the path is longer.
 - Everything arriving on the channel is untrusted input from that guest. The broker validates
   every message and never trusts a claim of identity in it.
+
+### Handshake and liveness
+
+- **Handshake.** The first line in each direction is a `hello` carrying the protocol version. The
+  guest's copy of priviledge is independent of the broker's (§6), so versions will drift; on a
+  mismatch the broker reports it in its pane and closes the channel, and the relay answers
+  clients with an "incompatible broker" error until it exits.
+- **Heartbeat.** The broker sends a `ping` periodically (default every 10 s) and the relay answers
+  `pong`. Liveness does not rely on end-of-file on the channel: runtimes don't guarantee that an
+  exec'd process sees its stdin close when the calling side dies, and they can't always kill it.
+  - The relay exits when it hasn't heard from the broker for a few intervals (default 30 s), or
+    on end-of-file.
+  - The broker treats a missing `pong` the same way as the channel ending: it kills the channel
+    process and restarts it with backoff.
+- **Takeover.** A relay starting on a socket that is already served by a live relay takes over:
+  it replaces the socket, and the old relay, now unreachable, exits once its heartbeat lapses. On
+  exit a relay removes the socket only if it is still its own (same inode). Refusing instead would
+  let an orphaned relay lock a restarted broker out of its guest. Takeover grants nothing to the
+  guest: any process in it could already answer on the socket, and results are only as
+  trustworthy to clients as the guest itself (§3).
+
+### Requests when the channel is lost
+
+Requests live in the broker's memory. When the channel ends:
+
+- Requests still **awaiting approval** fail without running.
+- Requests that are **running, awaiting release, or finished but undelivered** may already have
+  had effects (a write on a read-write resource). They are kept, flagged in the pane as "not
+  delivered", and a client can still fetch them with `wait <id>` once the channel is back.
+- A broker restart loses all in-memory requests. The audit log (below) records how far each one
+  got.
 
 ### Framing
 
 - **Client ↔ relay:** newline-delimited JSON, one request per connection. The client sends one
-  message (`run`, `wait`, `list`, `describe`) and reads event messages (`pending`, `result`,
+  request (`run`, `wait`, `list`, `describe`) and reads events (`pending`, `chunk`, `result`,
   `error`) until the connection closes. A client that disconnects does not cancel its request.
-- **Relay ↔ broker:** newline-delimited JSON over the channel, each line wrapping one message with
-  a connection id assigned by the relay: `{"conn": 7, "msg": {...}}`, plus `{"conn": 7, "close":
-  true}`. This multiplexes concurrent clients over one channel.
-- Byte payloads (stdin, stdout, stderr) are base64-encoded fields, so binary content is safe.
+- **Relay ↔ broker:** the same messages over the channel, each line wrapped with a connection id
+  assigned by the relay: `{"conn": 7, "msg": {...}}`, plus `{"conn": 7, "close": true}`. This
+  multiplexes concurrent clients over one channel. The relay does not interpret messages; it only
+  wraps and unwraps them.
+- **Byte payloads are streamed in chunks.** stdin travels from the client, and stdout and stderr
+  back to it, as `chunk` messages (`{"chunk": "stdout", "data": "<base64>"}`, at most 64 KiB of
+  data each), followed by a final message without payload (`end` from the client, `result` from
+  the broker). Base64 keeps binary content safe. Chunking keeps one large output from blocking
+  the other connections sharing the channel, and bounds line length.
+- **Line limit.** A line longer than 1 MiB is a protocol error: the relay drops that client's
+  connection, and the broker drops that connection id. Neither needs unbounded buffers.
 
 ### Other transports
 
@@ -436,9 +475,11 @@ other guests on the same network sniffing or spoofing it (network isolation or T
   `$XDG_CONFIG_HOME/priviledge` (config, §8), `$XDG_STATE_HOME/priviledge` (audit logs).
 - There is no approval socket in v1: approval happens only on `serve`'s terminal. A privileged-only
   approval socket for scripting (`pending`, `approve`, `deny`) can come later.
-- Audit log: `$XDG_STATE_HOME/priviledge/<guest>.jsonl`, one entry per request: guest, claimed
-  labels, reason, request (and the edited version, if any), decisions and timestamps, exit status,
-  output size and a hash of the output. Output bodies are not logged by default.
+- Audit log: `$XDG_STATE_HOME/priviledge/<guest>.jsonl`, written at each step of a request
+  (received, decided, started, finished, released, delivered), so a crash leaves a record of how
+  far it got. Entries carry the request id, guest, claimed labels, reason, request (and the edited
+  version, if any), decisions, timestamps, exit status, output size and a hash of the output.
+  Output bodies are not logged by default.
 
 ## 10. Technology
 
@@ -474,5 +515,8 @@ other guests on the same network sniffing or spoofing it (network isolation or T
 - Cancelling a running request from the approval prompt, and whether resources need a timeout.
 - Session (v2) design details: sentinels, prompt noise, long-running statements, cancellation.
 - Head/tail preview size in the approval prompt.
-- Whether a guest-side message size limit is needed to keep a misbehaving guest from exhausting
-  the broker.
+- Whether a request payload needs a total size cap (lines are already bounded, §9).
+- Whether requests should survive a broker restart. In v1 they don't; the audit log is the record.
+- Heartbeat and timeout defaults (10 s / 30 s) are guesses to tune in use.
+- **(verify)** what the relay sees when `serve` is killed hard, per runtime (end-of-file or
+  nothing). The heartbeat covers both, but it tells us how long orphans linger.
