@@ -202,9 +202,9 @@ http_access allow all
 # ~/.config/aiws/egress/aiws-trusted-shop.txt
 .anthropic.com
 .githubusercontent.com
-.rubygems.org
-.npmjs.org
 .pypi.org
+.pythonhosted.org
+.npmjs.org
 ...
 ```
 
@@ -246,8 +246,8 @@ WORKDIR /home/aiws
   Docker copies the image's home into it only when the volume is first created, so later image
   updates to anything under the home would never reach the guest.
 - **Per-user and self-updating tools live in the home volume** and are installed from inside the
-  guest: Claude Code (it self-updates), mise-managed toolchains (Python, Node, Java,
-  Go), nvim plugins and LSP servers. Baking toolchains into per-project images (`FROM aiws-base`)
+  guest: Claude Code (it self-updates), mise-managed toolchains (Python, Node, Java, Go), nvim
+  plugins and LSP servers. Baking toolchains into per-project images (`FROM aiws-base`)
   is the more reproducible option once they settle.
 - No sudo in the guest; `cap_drop` and `no-new-privileges` would defeat it anyway. Installing
   system packages means rebuilding the image from the privileged side.
@@ -322,9 +322,9 @@ choice matters:
 
 ## 9. Editor, LSP and agent (inside the guest)
 
-- nvim, its plugins and every LSP server run in the guest: ruby-lsp, typescript-language-server,
-  basedpyright/pyright, lua_ls, and so on. The plugin manager and mason.nvim install into the home
-  volume.
+- nvim, its plugins and every LSP server run in the guest: basedpyright/pyright,
+  typescript-language-server, lua_ls, and so on. The plugin manager and mason.nvim install into the
+  home volume.
 - VS Code, optionally, with Dev Containers' "Attach to Running Container", which runs the VS Code
   server and its extensions inside the guest.
 - Claude Code runs in the guest, logged in there, with its state in the home volume. Its global
@@ -337,8 +337,8 @@ choice matters:
   sandbox may not start with all capabilities dropped; Playwright then needs Chromium's
   `--no-sandbox`, leaving the guest as the boundary **(verify)**.
 - The git read-only token (SPEC.md §5) is the only native token, in the guest's git credential
-  store. Other read-only access (code host, error tracker, issue tracker)
-  goes through priviledge resources.
+  store. Other read-only access (code host, error tracker, issue tracker) goes through priviledge
+  resources.
 - Per-path tool state (Claude Code's per-project memory, `mise trust`, `direnv allow`) initialises
   fresh in the guest. Existing checkouts are not migrated; clone fresh.
 
@@ -455,17 +455,16 @@ or Podman, a sandboxed runtime (gVisor, Kata), or VMs.
 
 **Separate OS user** (the lightest option, no runtime): one user per guest; close the privileged
 home to them (`chmod o-rwx ~`; they are not in the privileged user's group), and give each its own
-toolchains. For interactive panes, prefer `ssh` to loopback over `sudo -u`/`su`: on macOS `su`
-does not allocate a new terminal, so the guest shell shares the privileged pane's terminal device.
-The broker's connection has no terminal (it starts `guest_exec` detached, DESIGN.md §3), so
-`sudo -u` is fine there. For ssh: key-only logins restricted to
-`AllowUsers <user>@127.0.0.1 <user>@::1`, no forwarding of any kind, and a dedicated key installed
-with `restrict,pty` (on macOS, launchd starts sshd on all interfaces and may ignore
-`ListenAddress` **(verify)**). Never give such a user
-sudo to the privileged account, including for Homebrew: sudo would authenticate the guest's own
-password, which other guest processes can capture, and brew run as its owner with guest-influenced
-input is equivalent to a shell as the owner. Egress per user needs a packet filter rule keyed on
-uid (`pf` on macOS, nftables on Linux) **(verify)**.
+toolchains. For interactive panes, prefer `ssh` to loopback over `sudo -u`/`su`: on macOS `su` does
+not allocate a new terminal, so the guest shell shares the privileged pane's terminal device. The
+broker's connection has no terminal (it starts `guest_exec` detached, DESIGN.md §3), so `sudo -u` is
+fine there. For ssh: key-only logins restricted to `AllowUsers <user>@127.0.0.1 <user>@::1`, no
+forwarding of any kind, and a dedicated key installed with `restrict,pty` (on macOS, launchd starts
+sshd on all interfaces and may ignore `ListenAddress` **(verify)**). Never give such a user sudo to
+the privileged account, including for Homebrew: sudo would authenticate the guest's own password,
+which other guest processes can capture, and brew run as its owner with guest-influenced input is
+equivalent to a shell as the owner. Egress per user needs a packet filter rule keyed on uid (`pf` on
+macOS, nftables on Linux) **(verify)**.
 
 ## 14. Verification checklist
 

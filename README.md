@@ -19,7 +19,7 @@ credentials:
 │ ~                                           │       priviledge retrieve "$id"        │
 │                                             │   └ waiting for approval...            │
 ├─ priviledge serve trusted shortener ────────┴────────────────────────────────────────┤
-│ [7] trusted/shortener · prod-db-ro                                                   │
+│ [3mxp9dq2vt] trusted/shortener · prod-db-ro                                          │
 │     reason: links idle 90+ days                                                      │
 │     SELECT count(*) FROM links                                                       │
 │      WHERE last_opened < now() - interval '90 days'                                  │

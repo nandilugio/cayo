@@ -21,19 +21,43 @@ One program, `priviledge`, with subcommands:
 that guest, and each guest gets its own approval pane. The guest is identified everywhere
 (prompt, audit log) as `<profile>/<name>`.
 
-**One request at a time.** The broker runs requests sequentially in arrival order (SPEC.md §7).
-A request's states:
+**Request states.** Each request carries one explicit state, and transitions are the only
+place it changes:
 
 ```
-queued ─▶ awaiting-approval ─▶ running ─▶ awaiting-release ─▶ settled ─▶ (retrieved: discarded)
+pending-approval ──▶ executing ──▶ pending-release ──▶ deliverable ─┐
+      │                  │                │                         │
+      │ n                │ exit≠0         │ n                       │
+      ▼                  ▼                ▼                         │
+   denied             failed        release-denied                  ├──▶ retrieved: deleted
+      │                  │                │                         │
+      └──────────────────┴────────────────┴─────────────────────────┤
+pending-approval ──▶ dropped  (channel lost) ───────────────────────┘
 ```
 
-- `awaiting-approval` is skipped when `confirm_request = false`, `awaiting-release` when
-  `confirm_output = false` (or the human answered `Y`). Checkers, later, run on entering
-  `awaiting-approval`.
-- **settled** is one of `done`, `failed` (the resource exited non-zero), `denied` (at approval or
-  release) or `dropped` (the connection was lost before `running`).
-- `cancel` discards a request in `queued` or `awaiting-approval`; afterwards its id is unknown.
+- A request enters `pending-approval` on arrival; the client gets its id at once. With
+  `confirm_request = false` it enters `executing` directly, and with `confirm_output = false` (or
+  the human's `Y`) a successful execution goes straight to `deliverable`. Checkers, later, run on
+  entering `pending-approval`.
+- The five states that lead to `retrieved` are **terminal**: the request is settled (SPEC.md §6) and
+  holds whatever `retrieve` will answer: the result, the resource's stdout on failure, or the
+  human's message. `retrieve` is a pull, so no state is needed for a delivery that breaks off: the
+  request stays terminal and the next `retrieve` starts over. A complete `retrieve` deletes the
+  request.
+- `cancel` deletes a request in `pending-approval`; afterwards its id is unknown.
+- `s` (skip) leaves the state as is and moves the request to the back of the prompt order.
+
+**One event loop, no threads.** The broker is a single `selectors` loop over the channel pipe, the
+running resource's stdout and stderr, the terminal, and a heartbeat timer. "The prompt queue" and
+"the outbox" are views over state (requests in a `pending-*` state in arrival order; requests in a
+terminal state), not separate structures. Requests run one at a time (SPEC.md §7): the next
+request, prompted or auto-approved, starts only when no request is `executing` or
+`pending-release`.
+
+The review pager and editor take over the terminal, but the loop keeps running underneath them:
+the tool runs as a child, the loop keeps answering heartbeats and clients, and pane output is
+buffered until the tool exits. Otherwise a minute in the pager would let the relay's heartbeat
+lapse.
 
 Resources run as child processes of the broker, in their own session without a controlling
 terminal, with stdin, stdout and stderr connected to the request. They can't prompt on, or write
@@ -88,13 +112,14 @@ on this guest's channel *is* this guest.
 - The relay runs as whichever user `guest_exec` lands on, and clients must run as that same user
   to reach its socket. With `docker exec -i` that is the image's default user; a command that
   switches user (e.g. `-u 0`) would create a socket the guest's normal user cannot use.
-- The relay listens on `~/.local/state/priviledge/relay.sock` (directory mode 0700). The path
-  deliberately ignores `$XDG_STATE_HOME` and `$XDG_RUNTIME_DIR`, which can be set in some sessions
-  and not in others (an interactive shell versus `guest_exec`); it depends only on the home
-  directory, so the relay and the clients always agree. `$PRIVILEDGE_SOCKET` overrides it, and
-  then must be set for every process in the guest (e.g. in the image's environment). Unix socket
-  paths are limited to about 100 bytes (103 on macOS, 107 on Linux); the relay fails with a clear
-  message if the path is longer.
+- The relay listens on `<home>/.local/state/priviledge/relay.sock` (directory mode 0700), where
+  `<home>` is the running user's home from the passwd database, not from the environment. The
+  relay and the clients start in different environments (`guest_exec` runs no login shell; the
+  agent's shell may export `XDG_STATE_HOME` or `XDG_RUNTIME_DIR`), so any path derived from
+  environment variables could differ between them and nobody would find the socket. There is no
+  override; add one only if a deployment's home cannot hold a Unix socket. Socket paths are
+  limited to about 100 bytes (103 on macOS, 107 on Linux); the relay fails with a clear message if
+  the path is longer.
 - Everything arriving on the channel is untrusted input from that guest. The broker validates
   every message and never trusts a claim of identity in it.
 
@@ -123,10 +148,26 @@ on this guest's channel *is* this guest.
 
 ## 5. Requests, results and channel loss
 
-Requests live in the broker's memory, keyed by id; ids are not reused. A settled request keeps
-its result until a `retrieve` completes: the client sends `retrieved` after writing the last byte
-to its stdout without error, and only then does the broker discard the result (SPEC.md §6). A
-`retrieve` that ends early (broken pipe, killed client) leaves the result in place.
+Requests live in the broker's memory, keyed by id. An id is `<run>-<request>`: the broker run's
+id (§8) and ten random base32 characters (50 bits) from the operating system's random source. No
+uniqueness check is kept: only ids within one run can collide, since the run prefix separates
+runs, and even an unusually busy run of 10,000 requests has a collision chance around 4 × 10⁻⁸.
+Random rather than sequential, an id tells an agent nothing about other sessions' requests, and a
+mistyped or stale id practically never lands on someone else's. The prompt shows only the request
+part. `wait` or `retrieve` for an id from an earlier run answers 248 (lost), with the audit log's
+last recorded step for that request on stderr.
+
+A settled request keeps its result until a `retrieve` completes: the client sends `retrieved` after
+writing the last byte to its stdout without error, and only then does the broker delete the request
+(SPEC.md §6). A `retrieve` that ends early (broken pipe, killed client) leaves the result in place.
+
+**Results are spooled, not held.** A resource's stdout is captured with
+`tempfile.SpooledTemporaryFile`: in memory up to a threshold (1 MiB), then rolled over to a file in
+the broker's private temp directory (§8). `view` rolls it over and opens that file, so the review
+copy is the capture itself. Output stops at a per-request cap (default 64 MiB): the resource is
+killed, the partial output is discarded, and the request becomes `failed`: `retrieve` exits 1 with
+empty stdout and a `priviledge:` line on stderr telling the agent to narrow its request. Memory
+stays flat whatever the result size, and waiting results cost disk, not RAM.
 
 When the channel ends, the broker marks the guest offline and applies the rules in SPEC.md §6:
 requests that have not started become `dropped` (exit 249 on `retrieve`); requests that are
@@ -155,11 +196,12 @@ in-memory requests; the audit log (§8) is the record.
   connection, and the broker drops that connection id. Neither needs unbounded buffers.
 - **Validation and limits (SPEC.md §3).** The broker parses each line with the standard library's
   JSON decoder, catching its recursion limit, and checks the result against a strict schema per
-  message type: known keys only, ids as integers, no unknown message types. Anything else is a
-  protocol error for that connection. Per guest, it caps the total payload of a request (default
-  16 MiB), the number of outstanding requests (default 64) and the number of open connections
-  (default 32); beyond a cap, new requests are refused with an error, not queued. The parser and
-  the schema checks are the broker's only exposure to guest bytes, and they get fuzzed (§12).
+  message type: known keys only, ids of the form `<run>-<request>`, no unknown message types.
+  Anything else is a protocol error for that connection. Per guest, it caps the total payload of a
+  request (default 16 MiB), the number of outstanding requests (default 64) and the number of open
+  connections (default 32); beyond a cap, new requests are refused with exit 253 and a message, not
+  queued. The parser and the schema checks are the broker's only exposure to guest bytes, and they
+  get fuzzed (§11).
 
 ## 7. Other transports
 
@@ -172,9 +214,14 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
 - Config and state follow the **XDG Base Directory** spec on the privileged side:
   `$XDG_CONFIG_HOME/priviledge` (config, SPEC.md §8), `$XDG_STATE_HOME/priviledge` (audit logs).
 - Audit log: `$XDG_STATE_HOME/priviledge/<profile>-<name>.jsonl`, one JSON line per request step,
-  each carrying the request id (SPEC.md §9).
-- Review temp files (SPEC.md §7) and human-resource answer files (SPEC.md §8) are created in a
-  privileged-owned directory with mode 0700 and removed after use.
+  each carrying the request id (SPEC.md §9). `profile/name` is unique only while the guest exists
+  (the runtime enforces it: container names, VM names, user names), and a guest recreated with the
+  same name shares the file, so each `serve` start writes a start record with a **run id** (a
+  random six-character base32 token; the record also carries the start time) and every entry
+  carries it. The run id is also the first part of every request id (§5).
+- Spooled results (§5), review temp files (SPEC.md §7) and human-resource answer files
+  (SPEC.md §8) live in a privileged-owned temp directory with mode 0700, removed with the request
+  or when the broker exits.
 
 ## 9. Technology
 
@@ -182,9 +229,9 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
   bundle via shiv/pex), so there is no dependency on the stock system Python and no version matrix
   to support.
 - Standard library only at runtime: `socket`, `selectors`, `subprocess`, `json`, `csv`, `base64`,
-  `argparse`, `tomllib`, `hashlib`, `shlex`. No third-party runtime dependencies. Formatting in
-  the inline prompt is stdlib-only (SPEC.md §7's review-surface rule); anything richer is the
-  external pager or editor.
+  `argparse`, `tomllib`, `hashlib`, `shlex`, `tempfile`, `pwd`, `secrets`. No third-party runtime
+  dependencies. Formatting in the inline prompt is stdlib-only (SPEC.md §7's review-surface rule);
+  anything richer is the external pager or editor.
 - **Rust is a deliberate later option, not now.** priviledge's untrusted input is JSON over the
   channel (stdlib `json`, memory-safe) that is mostly passed through to subprocesses; the
   security-critical logic is process and permission handling, not parsing. A Rust rewrite fits as
@@ -209,7 +256,8 @@ ships (SPEC.md §10).
    *inside* the real boundary surfaces the true frictions instead of guessing them.
 2. **Core loop, minimal:** `serve` with configuration resolution, the channel and relay, one exec
    resource, `request`/`wait`/`retrieve` and the sequential prompt with both confirmations.
-   Against a local dev database.
+   Against a local dev database. The channel parser and schema checks are fuzzed with malformed
+   and adversarial input from this iteration on.
 3. **Core loop, complete:** `list`, `describe`, `pending`, `cancel`, output review with the
    external pager and editor, the audit log, a read-only cloud resource.
 4. **Git and deploy flow** (SETUP.md): clean clones, the `ext::` remote, push and deploy from a
@@ -219,8 +267,6 @@ ships (SPEC.md §10).
 ## 12. Open questions
 
 - The default caps in §6 (payload, outstanding requests, connections) are guesses to tune in use.
-- Fuzzing the channel parser and schema checks with malformed and adversarial input is part of
-  the core-loop iteration, not a later task.
 - Heartbeat and timeout defaults (10 s / 30 s) are guesses to tune in use.
 - **(verify)** what the relay sees when `serve` is killed hard, per runtime (end-of-file or
   nothing). The heartbeat covers both, but it tells us how long orphans linger.

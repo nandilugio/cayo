@@ -67,7 +67,8 @@ Non-goals:
 - **Client**: the part of priviledge inside the guest, the commands the agent runs (§6).
 
 Why the human's tooling lives in the AI workspace: any tool that interprets project files can run
-project code. LSP servers load `Gemfile`s, `node_modules` plugins, and virtualenv interpreters.
+project code. LSP servers load project configuration, `node_modules` plugins, and virtualenv
+interpreters.
 Dev servers, test runners, installs, build and deploy scripts run it by design. Separating only
 the agent from the human would still leave the human constantly running agent-written code with
 full privileges. The split must follow *who executes project code*, not *who types*.
@@ -274,9 +275,10 @@ one thing, so any of them can be composed with other tools without ambiguity.
   and whether it is auto-approved for this guest.
 - `priviledge request <resource> -r <reason> [-p key=value]... [-- args...] [< payload]`: submit a
   request. Prints the request id on stdout and exits at once.
-- `priviledge wait <id>... [--timeout <seconds>]`: block until every listed request is settled
-  (done, failed, denied or dropped). Prints nothing on stdout. Without `--timeout` it waits
-  indefinitely. It exits 0 once all are settled; `retrieve` then tells each outcome.
+- `priviledge wait <id>... [--timeout <seconds>]`: block until every listed request is settled (its
+  result is ready, it failed, was denied, or was dropped). Prints nothing on stdout. Without
+  `--timeout` it waits indefinitely. It exits 0 once all are settled; `retrieve` then tells each
+  outcome.
 - `priviledge retrieve <id>`: write the result to stdout. Never blocks: if the request is not
   settled, it exits with a distinct status.
 - `priviledge pending`: this guest's requests not yet retrieved, with resource and state.
@@ -296,14 +298,18 @@ priviledge wait "$a" "$b" && priviledge retrieve "$a" | jq ... && priviledge ret
 ```
 
 - `-r <reason>` is required. It is shown to the human and written to the audit log.
-- Inputs travel **by value**: the payload on stdin, extra arguments after `--`, named parameters
-  as `-p key=value`, each only if the resource declares it (§8). A file the agent wants to use
-  (a `.sql` or a Ruby script) is read by the *client* and sent as content. The broker never opens
-  workspace paths, and never writes into them: the agent redirects `retrieve`'s stdout where it
-  wants it.
+- Inputs travel **by value**: the payload on stdin, extra arguments after `--`, named parameters as
+  `-p key=value`, each only if the resource declares it (§8). A file the agent wants to use (a
+  `.sql` file or a Python script) is read by the *client* and sent as content. The broker never
+  opens workspace paths, and never writes into them: the agent redirects `retrieve`'s stdout where
+  it wants it.
 - `wait` with a timeout exists because agent shell tools have hard timeouts (Claude Code's Bash
   tool: 2 min default, 10 min max). A timed-out `wait` changes nothing: the agent waits again.
 - A client that exits does not cancel its request. `pending` recovers ids the agent lost.
+- **Request ids are opaque and random** (for example `k7f2qa-3mxp9dq2vt`). They never repeat for a
+  guest, not even across broker restarts, and they say nothing about how many other requests
+  exist. An id from before a restart is reported as lost (248), never confused with a newer
+  request.
 - **A result is kept until it has been retrieved completely, then discarded.** Completely means
   the client wrote the last byte to its stdout without error and reported that to the broker; a
   broken pipe leaves the result in place for another `retrieve`. An agent that needs a result
@@ -321,14 +327,15 @@ client's own codes cannot collide with theirs:
 |---|---|---|---|
 | 0 | Success. For `retrieve`: the resource succeeded and its output is on stdout | all | |
 | 1 | The resource failed. stdout carries whatever the resource chose to tell the agent | `retrieve` | Read stdout |
+| 248 | Lost: the broker restarted before the request was retrieved. stderr says whether it had started | `wait`, `retrieve` | Check its effects before repeating it, if it may have run |
 | 249 | Dropped: the broker connection was lost before the request ran; nothing happened | `retrieve` | Request again |
 | 250 | Not settled (`retrieve`), or timed out (`wait`) | `wait`, `retrieve` | Wait again |
 | 251 | Denied by the human, the request or the release of its output, with their message on stderr | `retrieve` | Not repeat it as is |
 | 252 | Unknown id: never existed, already retrieved, or cancelled by the agent | `wait`, `retrieve`, `cancel` | Nothing to fetch |
-| 253 | Invalid request: unknown resource, undeclared input, missing reason, or `cancel` on a request that already started | `request`, `describe`, `cancel` | Fix the call |
+| 253 | Invalid request: unknown resource, undeclared input, missing reason, payload too large, too many outstanding requests, or `cancel` on a request that already started | `request`, `describe`, `cancel` | Fix the call, or retrieve or cancel outstanding requests |
 | 254 | Broker not connected | all | Retry once it is back |
 
-Codes 249–254 are outside the ranges ordinary tools and shells use. Every non-zero exit comes
+Codes 248–254 are outside the ranges ordinary tools and shells use. Every non-zero exit comes
 with a one-line `priviledge: ...` message on stderr.
 
 **When the broker connection is lost** (guest restarted, broker stopped):
@@ -338,8 +345,8 @@ with a one-line `priviledge: ...` message on stderr.
 - Requests that are **running, awaiting release, or settled but not retrieved** may already have
   had effects (a write on a write resource). They are kept, flagged to the human as "not
   retrieved", and the agent can still `retrieve` them once the connection is back.
-- If the broker itself restarts, outstanding requests are lost. The audit log (§9) records how far
-  each one got.
+- If the broker itself restarts, outstanding requests are lost: `wait` and `retrieve` answer 248
+  for their ids. The audit log (§9) records how far each one got.
 
 ## 7. Approval
 
@@ -347,11 +354,11 @@ Each guest has its own approval prompt, on the terminal where the human runs
 `priviledge serve <profile> <name>`. The prompt is line-oriented, like `git add -p`:
 
 ```
-[12] trusted/shop · prod-db-ro
+[3mxp9dq2vt] trusted/shop · prod-db-ro
      reason: count overdue orders by region
      SELECT region, count(*) FROM orders WHERE status = 'open' GROUP BY region
 run? [y]es [Y]es+release [n]o(+msg) [s]kip [e]dit [v]iew [?]
-[12] exit 0 · 214 lines · 6.1 KB · 1.4 s
+[3mxp9dq2vt] exit 0 · 214 lines · 6.1 KB · 1.4 s
      region,count
      eu-west,412
      ... (first/last lines)
@@ -373,14 +380,14 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact
   must not be able to move the cursor, hide lines, restyle the prompt, or send queries to the
   terminal.
 - The inline prompt shows escaped plain text with simple formatting (JSON pretty-printed, CSV
-  aligned). Output is not size-limited on the way to the guest; the prompt shows size and a
-  head/tail preview. Request payloads are capped (§3).
+  aligned). The prompt shows size and a head/tail preview. Output is limited only by a
+  per-request cap (a resource that exceeds it fails, telling the agent to narrow the request);
+  request payloads are capped too (§3).
 - `view` opens the content in `$PRIVILEDGE_REVIEW_PAGER`, from a privileged-owned temp file whose
   extension comes from the resource's `input_syntax` / `output_syntax` (§8). `edit` does the same
-  with `$PRIVILEDGE_REVIEW_EDITOR`. Both are argv strings, run without a shell, with the file's path
-  appended as the last argument; the defaults are
-  `less` (without `-R`, and with its input preprocessor disabled) and `vi`. SETUP.md describes safe
-  richer choices.
+  with `$PRIVILEDGE_REVIEW_EDITOR`. Both are argv strings, run without a shell, with the file's
+  path appended as the last argument. The defaults are `less` (without `-R`, and with its input
+  preprocessor disabled) and `vi`; SETUP.md describes safe richer choices.
 
 ### Review surfaces run as privileged over hostile content
 
@@ -613,8 +620,9 @@ and safe.
 
 ## 9. Audit log
 
-Every request is recorded on the privileged side, one log per guest: request id, guest
-(`profile/name`), reason, the request as submitted and as run (if edited), decisions,
+Every request is recorded on the privileged side, one log per guest (`profile/name`), with each
+broker run marked so that a guest recreated under the same name stays distinguishable. Entries
+carry: request id, reason, the request as submitted and as run (if edited), decisions,
 timestamps, exit status, the resource's stderr, output size and a hash of the output, and the
 unredacted output when the released one was redacted. Output bodies are not logged otherwise.
 Each step of a request (received, decided, started, finished, released, retrieved) is recorded as
