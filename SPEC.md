@@ -105,6 +105,13 @@ traffic, or acting as it. Consequences:
   could only be trusted if the guest were, and then they would not be needed. A request carries
   the resource, its inputs, and the agent's stated reason, which is judged, not trusted.
 - What a guest may request, and with how much confirmation, is fixed by its profile (§8).
+- **The client cannot authenticate the relay.** Another process in the guest can replace the
+  relay's socket and answer clients itself: read their requests, feed them fabricated results.
+  That is the guest lying to itself, and it is accepted like every other within-guest attack.
+- **The broker treats every byte from the guest as hostile input**, and stays bounded: it accepts
+  only messages that match its schema, limits the size of a request's payload and the number of
+  requests a guest may have outstanding, and rejects the rest. Nothing a guest sends can name a
+  path, choose a file, or select anything on the privileged side.
 - Anything configured inside the guest (the agent's permission settings, its instructions) is
   convenience, not a security control. The boundary is the guest itself.
 
@@ -182,7 +189,10 @@ public tracker in `public`.
 - Network services the guest can reach: dev services (which hold dev data only) and, depending on
   the deployment, services listening on the host (see SETUP.md).
 - Escape from the guest through a runtime or kernel vulnerability. The strength of this boundary
-  is a deployment choice.
+  is a deployment choice. One class deserves naming, because priviledge triggers it: running a
+  program inside a hostile guest (contract item 2) is what container-escape flaws such as
+  CVE-2019-5736 in runc exploited. Keep the runtime patched, and prefer runtimes that put a VM
+  around each guest (see SETUP.md).
 - The human being misled by what the agent shows them. Mitigated by rendering request and output
   content safely (§7), by keeping approvals specific, and later by checkers (§10).
 
@@ -363,7 +373,8 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact
   must not be able to move the cursor, hide lines, restyle the prompt, or send queries to the
   terminal.
 - The inline prompt shows escaped plain text with simple formatting (JSON pretty-printed, CSV
-  aligned). Output is not size-limited; the prompt shows size and a head/tail preview.
+  aligned). Output is not size-limited on the way to the guest; the prompt shows size and a
+  head/tail preview. Request payloads are capped (§3).
 - `view` opens the content in `$PRIVILEDGE_REVIEW_PAGER`, from a privileged-owned temp file whose
   extension comes from the resource's `input_syntax` / `output_syntax` (§8). `edit` does the same
   with `$PRIVILEDGE_REVIEW_EDITOR`. Both are argv strings, run without a shell, with the file's path

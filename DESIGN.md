@@ -153,6 +153,13 @@ in-memory requests; the audit log (§8) is the record.
   connections sharing the channel, and bounds line length.
 - **Line limit.** A line longer than 1 MiB is a protocol error: the relay drops that client's
   connection, and the broker drops that connection id. Neither needs unbounded buffers.
+- **Validation and limits (SPEC.md §3).** The broker parses each line with the standard library's
+  JSON decoder, catching its recursion limit, and checks the result against a strict schema per
+  message type: known keys only, ids as integers, no unknown message types. Anything else is a
+  protocol error for that connection. Per guest, it caps the total payload of a request (default
+  16 MiB), the number of outstanding requests (default 64) and the number of open connections
+  (default 32); beyond a cap, new requests are refused with an error, not queued. The parser and
+  the schema checks are the broker's only exposure to guest bytes, and they get fuzzed (§12).
 
 ## 7. Other transports
 
@@ -211,7 +218,9 @@ ships (SPEC.md §10).
 
 ## 12. Open questions
 
-- Whether a request payload needs a total size cap (lines are already bounded, §6).
+- The default caps in §6 (payload, outstanding requests, connections) are guesses to tune in use.
+- Fuzzing the channel parser and schema checks with malformed and adversarial input is part of
+  the core-loop iteration, not a later task.
 - Heartbeat and timeout defaults (10 s / 30 s) are guesses to tune in use.
 - **(verify)** what the relay sees when `serve` is killed hard, per runtime (end-of-file or
   nothing). The heartbeat covers both, but it tells us how long orphans linger.
