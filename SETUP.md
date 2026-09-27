@@ -13,17 +13,17 @@ Terms (guest, profile, privileged side, broker) are as defined in
 ## 1. Overview
 
 ```
-host: privileged side                            Docker VM
-┌───────────────────────────────────────┐   ┌──────────────────────────────────┐
-│ terminal + tmux                       │   │ guest aiws-trusted-shop          │
-│   panes: docker exec -it … aiws-…    │──▶│   nvim + LSP, claude, tests,     │
-│   pane:  priviledge serve trusted shop │──▶│   dev servers, priviledge relay   │
-│ secrets, priviledge config             │   │   repos in a volume              │
-│ clean clones (review, push, deploy)   │   │   dotfiles mounted read-only     │
-│ docker CLI (runtime control)          │   ├──────────────────────────────────┤
-│ browser                               │   │ egress proxy (per guest)         │
-└───────────────────────────────────────┘   │ dev services (project compose)   │
-                                            └──────────────────────────────────┘
+host: privileged side                         Docker VM
+┌─────────────────────────────────────────┐   ┌──────────────────────────────────┐
+│ terminal + tmux                         │   │ guest aiws-trusted-shop          │
+│   panes: docker exec -it … aiws-…       │──▶│   nvim + LSP, claude, tests,     │
+│   pane:  priviledge serve trusted shop  │──▶│   dev servers, priviledge relay  │
+│ secrets, priviledge config              │   │   repos in a volume              │
+│ clean clones (review, push, deploy)     │   │   dotfiles mounted read-only     │
+│ docker CLI (runtime control)            │   ├──────────────────────────────────┤
+│ browser                                 │   │ egress proxy, port forwarder     │
+└─────────────────────────────────────────┘   │ dev services (project compose)   │
+                                              └──────────────────────────────────┘
 ```
 
 - A **guest** is a container created on demand from a **profile** (SPEC.md §3): the profile decides

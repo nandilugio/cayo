@@ -60,14 +60,14 @@ request (exit 253).
 ## 3. Channel and relay
 
 ```
-privileged side                                  guest trusted/shop
-┌──────────────┐  guest_exec                 ┌──────────────────────────┐
-│ priviledge    │  (docker exec -i            │ priviledge relay          │
-│ serve        │   aiws-trusted-shop         │   listens on a Unix      │
-│ trusted shop │ ────── priviledge relay) ──▶ │   socket in the guest    │
-│              │ ◀───── stdin/stdout ──────▶ │          ▲               │
-└──────────────┘                             │ priviledge request ... ───┘
-                                             └──────────────────────────┘
+privileged side                               guest trusted/shop
+┌──────────────┐  guest_exec                  ┌──────────────────────────────┐
+│ priviledge   │  (docker exec -i             │ priviledge relay             │
+│ serve        │   aiws-trusted-shop          │   listens on a Unix socket   │
+│ trusted shop │ ────── priviledge relay) ──▶ │   in the guest               │
+│              │ ◀───── stdin/stdout ───────▶ │                          ▲   │
+└──────────────┘                              │ priviledge request ... ──┘   │
+                                              └──────────────────────────────┘
 ```
 
 **Why this shape.** In a normal client-server setup the host listens, the guest dials in, and the
