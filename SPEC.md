@@ -187,8 +187,16 @@ public tracker in `public`.
   The executables are the human's; §8 states what they must guarantee.
 - Anything the AI workspace can reach over the network with credentials it legitimately holds or
   finds in its own files. Secrets must not be placed in the guest.
-- Network services the guest can reach: dev services (which hold dev data only) and, depending on
-  the deployment, services listening on the host (see SETUP.md).
+- **Known issue: the agent's own credential.** Every guest that runs an agent holds the agent's
+  login or API key, including profiles that otherwise hold nothing. Use a dedicated key with a
+  spending limit for untrusted profiles.
+- An egress allow-list narrows C-egress but doesn't close it. Any allowed host that stores data for
+  whoever authenticates (a model provider's API with an attacker's key, a package registry, a code
+  host) can carry data out. That is why `public` reviews every output rather than relying on its
+  allow-list.
+- Network services the guest can reach: dev services (which hold dev data only, and must have no
+  route out of their own, since the guest can often run code in them) and, depending on the
+  deployment, services listening on the host (see SETUP.md).
 - Escape from the guest through a runtime or kernel vulnerability. The strength of this boundary
   is a deployment choice. One class deserves naming, because priviledge triggers it: running a
   program inside a hostile guest (contract item 2) is what container-escape flaws such as
@@ -282,7 +290,8 @@ one thing, so any of them can be composed with other tools without ambiguity.
 - `priviledge retrieve <id>`: write the result to stdout. Never blocks: if the request is not
   settled, it exits with a distinct status.
 - `priviledge pending`: this guest's requests not yet retrieved, with resource and state.
-- `priviledge cancel <id>`: withdraw a request that has not started. It is discarded.
+- `priviledge cancel <id>`: withdraw a request that is still queued (waiting for approval or for
+  its turn). It is discarded.
 
 ```sh
 id=$(priviledge request prod-db-ro -r "count overdue orders by region" <<'SQL'
@@ -306,10 +315,10 @@ priviledge wait "$a" "$b" && priviledge retrieve "$a" | jq ... && priviledge ret
 - `wait` with a timeout exists because agent shell tools have hard timeouts (Claude Code's Bash
   tool: 2 min default, 10 min max). A timed-out `wait` changes nothing: the agent waits again.
 - A client that exits does not cancel its request. `pending` recovers ids the agent lost.
-- **Request ids are opaque and random** (for example `k7f2qa-3mxp9dq2vt`). They never repeat for a
-  guest, not even across broker restarts, and they say nothing about how many other requests
-  exist. An id from before a restart is reported as lost (248), never confused with a newer
-  request.
+- **Request ids are opaque and random** (for example `k7f2qa-3mxp9dq2vt`). They are long enough
+  that in practice they don't repeat for a guest, not even across broker restarts, and they say
+  nothing about how many other requests exist. An id from before a restart is reported as lost
+  (248), not confused with a newer request.
 - **A result is kept until it has been retrieved completely, then discarded.** Completely means
   the client wrote the last byte to its stdout without error and reported that to the broker; a
   broken pipe leaves the result in place for another `retrieve`. An agent that needs a result
@@ -332,7 +341,7 @@ client's own codes cannot collide with theirs:
 | 250 | Not settled (`retrieve`), or timed out (`wait`) | `wait`, `retrieve` | Wait again |
 | 251 | Denied by the human, the request or the release of its output, with their message on stderr | `retrieve` | Not repeat it as is |
 | 252 | Unknown id: never existed, already retrieved, or cancelled by the agent | `wait`, `retrieve`, `cancel` | Nothing to fetch |
-| 253 | Invalid request: unknown resource, undeclared input, missing reason, payload too large, too many outstanding requests, or `cancel` on a request that already started | `request`, `describe`, `cancel` | Fix the call, or retrieve or cancel outstanding requests |
+| 253 | Invalid request: unknown resource, undeclared input, missing reason, payload too large, too many outstanding requests, or `cancel` on a request that is no longer queued | `request`, `describe`, `cancel` | Fix the call, or retrieve or cancel outstanding requests |
 | 254 | Broker not connected | all | Retry once it is back |
 
 Codes 248–254 are outside the ranges ordinary tools and shells use. Every non-zero exit comes
@@ -386,8 +395,9 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact
 - `view` opens the content in `$PRIVILEDGE_REVIEW_PAGER`, from a privileged-owned temp file whose
   extension comes from the resource's `input_syntax` / `output_syntax` (§8). `edit` does the same
   with `$PRIVILEDGE_REVIEW_EDITOR`. Both are argv strings, run without a shell, with the file's
-  path appended as the last argument. The defaults are `less` (without `-R`, and with its input
-  preprocessor disabled) and `vi`; SETUP.md describes safe richer choices.
+  path appended as the last argument. The defaults are `less -+r -+R --no-lessopen` (raw control
+  characters off even if the `LESS` variable turns them on, input preprocessor disabled) and `vi`.
+  Both load the human's own settings for those tools; SETUP.md describes safe choices.
 
 ### Review surfaces run as privileged over hostile content
 
@@ -413,9 +423,10 @@ The same rule applies to checkers (§10): external executables, not in-process p
 ### Configuration file
 
 `$XDG_CONFIG_HOME/priviledge/config.toml` (privileged-owned, mode 0600), i.e.
-`~/.config/priviledge/` by default. The broker refuses to start if the config, the resources
-directory, or any resource executable is group- or world-writable, or not owned by the privileged
-user. A leading `~` in paths is expanded.
+`~/.config/priviledge/` by default. The broker refuses to start if the config file or any
+resource's `run` executable, or any directory above either of them up to the home directory, is
+group- or world-writable or not owned by the privileged user: a writable directory would let
+someone swap the file. A leading `~` in paths is expanded.
 
 The file declares **resources** (what exists) and **profiles** (who may use what, with how much
 confirmation). Guests are not in the file: a guest is an instance of a profile, created by the
@@ -532,6 +543,15 @@ environment variables, and, if `args = true`, the extra arguments as argv. The a
 any other part of its environment. It fetches its own secrets with whatever the OS provides (macOS
 `security`, Linux `secret-tool`, `pass`, `op read`, ...).
 
+**Known risk: the inherited environment.** Apart from those parameters, a resource inherits the
+broker's environment, i.e. whatever was exported in the shell that started `serve`. Many tools
+let the environment choose their credential and configuration (for the AWS CLI, variables like
+`AWS_ACCESS_KEY_ID` override its credentials file; libpq reads `PG*` variables). An admin key
+exported for some unrelated task would then reach every resource, and a read-only resource that
+auto-approves would silently run with it. So a resource should start its tool from an empty
+environment (`env -i`, passing on only what the tool needs), as SETUP.md's examples do. Whether
+the broker should do this itself is an open question (§11).
+
 Resource executables must reference only privileged-owned files. A script taken from a project
 (for example a repo's `bin/console`) is used from a privileged clean clone at a reviewed
 commit (§3, the exception to the core rule), never from the AI workspace.
@@ -543,11 +563,14 @@ the agent. So the executable is exactly the kind of program the core rule (§3) 
 must hold three properties. These protect the host and the credential itself; they don't classify
 requests as reads or writes, so they don't conflict with §5.
 
-1. **Nothing in the input runs on the host.** Many clients interpret part of their input
-   locally, and handing them agent input directly gives the agent a shell as the privileged user:
+1. **Nothing in the input runs on the host or touches its files.** Many clients interpret part of
+   their input locally, and handing them agent input directly gives the agent a shell as the
+   privileged user, or the privileged user's files:
    - psql's meta-commands: `\!` runs a shell command, `\o |cmd` and `\copy ... TO PROGRAM` pipe to
      one, `\i`, `\o file` and `\w` read and write host files. `-c` doesn't help: a single
      meta-command is accepted there too.
+   - The AWS CLI reads any parameter written as `file://<path>` from the host, and `aws s3 cp`
+     writes to host paths.
    - Database shells that embed a scripting runtime run any input as code in that runtime.
    - Local interpreters generally: `python`, `node`, `sh`, a local `manage.py shell`.
 
@@ -562,34 +585,18 @@ requests as reads or writes, so they don't conflict with §5.
    resource's profile, since otherwise `--profile admin` in the arguments would pick the admin
    credential.
 3. **The input can't make the tool reveal its credential.** A leaked credential becomes a native
-   grant (§5) that bypasses approval and the audit log. For example, `aws configure get` and
-   `aws configure export-credentials` print it, and a confined psql told to `\connect` to another
-   host sends it the password. With `args = true`, allow-list the subcommands in the executable.
-   Output review is a backstop only when `confirm_output = true`.
+   grant (§5) that bypasses approval and the audit log. For example, `aws configure
+   export-credentials` and `aws sts get-session-token` print one, and a confined psql told to
+   `\connect` to another host sends it the password. With `args = true`, allow-list the operations
+   in the executable rather than deny-listing the dangerous ones. Output review is a backstop only
+   when `confirm_output = true`.
 
-```sh
-#!/bin/sh
-# aws-readonly: aws with only the read-only profile reachable, and no `configure`.
-# Global options may precede the subcommand, so check every argument.
-for a in "$@"; do
-  [ "$a" = configure ] && { echo "aws configure is not allowed"; exit 1; }
-done
-export AWS_CONFIG_FILE=~/.config/priviledge/aws/readonly.config
-export AWS_SHARED_CREDENTIALS_FILE=~/.config/priviledge/aws/readonly.credentials
-exec aws "$@"
-```
-
-```sh
-#!/bin/sh
-# prod-db-ro: `sqlquery` is the human's driver-based script: SQL in on stdin, CSV out,
-# and the driver's own errors on stderr, for the human.
-PGPASSWORD=$(security find-generic-password -s prod-db-ro -w) \
-  exec ~/.config/priviledge/bin/sqlquery "host=... user=app_ro dbname=... options='-c statement_timeout=60s'"
-```
+SETUP.md shows two example wrappers written to these rules.
 
 **Read-only is not harmless on a primary database.** A read-only role can't write, but an
-auto-approved query can still load production. Bound the cost with a role-level or connection
-`statement_timeout`, as above.
+auto-approved query can still load production. Bound the cost with a `statement_timeout` on the
+role or the connection, and have the client send exactly one statement per request: a `SET`
+earlier in the same request would lift the timeout.
 
 An auto-approved resource with `args = true` exposes everything its credential can read (§5,
 condition 2): a read-only cloud role can often read parameters, secrets stores and object storage.
@@ -625,8 +632,8 @@ broker run marked so that a guest recreated under the same name stays distinguis
 carry: request id, reason, the request as submitted and as run (if edited), decisions,
 timestamps, exit status, the resource's stderr, output size and a hash of the output, and the
 unredacted output when the released one was redacted. Output bodies are not logged otherwise.
-Each step of a request (received, decided, started, finished, released, retrieved) is recorded as
-it happens, so a crash leaves a record of how far every request got.
+Each step of a request (received, decided, started, finished, released, retrieved, or cancelled or
+dropped) is recorded as it happens, so a crash leaves a record of how far every request got.
 
 ## 10. Backlog
 
@@ -666,6 +673,9 @@ document may still change, `1.0` when they stop.
 
 - Which SaaS tokens can actually be scoped read-only (trackers, code hosts, chat) **(verify)**.
 - Cancelling a running request from the approval prompt, and whether resources need a timeout.
+- Whether the broker should run resources with a fixed environment instead of its own (§8, the
+  inherited environment). It would close that risk for every resource, at the cost of each one
+  setting what it needs.
 - Head/tail preview size in the approval prompt.
 - Whether requests should survive a broker restart. For now they don't; the audit log is the
   record.

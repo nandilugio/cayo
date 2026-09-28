@@ -3,7 +3,7 @@
 Status: draft. This describes **one** way to deploy the AI workspace around priviledge: Docker
 containers on macOS. priviledge itself does not depend on it; it only needs the deployment contract
 in [SPEC.md §4](SPEC.md#4-deployment-contract); how priviledge reaches a guest is in
-[DESIGN.md §3](DESIGN.md#3-channel-and-relay). Other setups are sketched in §13. Items marked
+[DESIGN.md §3](DESIGN.md#3-channel-and-relay). Other setups are sketched in §14. Items marked
 **(verify)** must be checked on the real machine. Every command here changes the machine's
 configuration, so the human reviews and runs it.
 
@@ -33,9 +33,10 @@ host: privileged side                         Docker VM
   shells) run inside the same guest.
 - On macOS, all containers run inside the runtime's Linux VM, so the host is behind a VM boundary.
   Guests are separated from each other by kernel namespaces inside that VM, which is weaker but
-  adequate for project-vs-project trust.
+  adequate for project-vs-project trust. It is not adequate for `hostile-sample` guests, which run
+  exploit material next to the trusted guests' kernel: run those in a separate VM (§14).
 - The privileged side drives guests only through the runtime's CLI, and never runs code written in
-  a guest except reviewed code at a pinned commit (§10, §11).
+  a guest except reviewed code at a pinned commit (§11, §12).
 
 ## 2. Container runtime
 
@@ -47,7 +48,7 @@ needs `exec -i`.
   Podman are free. OrbStack is paid for commercial use.
 - **File sharing:** restrict the runtime's shared host paths to what containers actually mount:
   the dotfiles and exchange directories (§4), and the clean-clone paths that project compose files
-  bind-mount (§11). Not all of `/Users`. If a guest escaped into the runtime's VM, it would reach
+  bind-mount (§12). Not all of `/Users`. If a guest escaped into the runtime's VM, it would reach
   whatever the VM can see, including those clean clones. **(verify)** that Docker Desktop allows
   removing the default paths.
 - **Never** give a guest the runtime's control socket (`/var/run/docker.sock` or equivalent),
@@ -62,12 +63,15 @@ reference set:
 | Profile | Image | Mounted | Native tokens | Egress (§5) |
 |---|---|---|---|---|
 | `trusted` | `aiws-base` | home volume, dotfiles (ro), exchange | git read-only token | proxy, allow-list |
-| `public` | `aiws-base` | same | git read-only token | proxy, allow-list |
+| `public` | `aiws-base` | same | none (public repos clone anonymously) | proxy, allow-list |
 | `hostile-web` | `aiws-base` | fresh home volume, exchange only | none | proxy, public internet only |
 | `hostile-sample` | `aiws-base` | fresh home volume, exchange only | none | none (`--network none`) |
 
 `hostile-*` guests are meant to be disposable: created for the task, removed after (`aiws rm`).
 No broker runs for them; results leave through the exchange directory, carried by the human.
+
+Every guest that runs an agent also holds the agent's own login or key (§10), a known issue in
+SPEC.md §3.
 
 ## 4. Guests
 
@@ -82,8 +86,9 @@ cmd=$1; shift
 case $cmd in
   new)
     p=$1; n=$2; g="aiws-$p-$n"
-    docker volume create "$g-home" >/dev/null
-    mkdir -p "$HOME/aiws-exchange/$g"
+    case $n in
+      ''|*-*) echo "guest names can't be empty or contain '-'" >&2; exit 64 ;;
+    esac
     home="-v $g-home:/home/aiws -v $HOME/aiws-exchange/$g:/home/aiws/exchange"
     case $p in
       trusted|public) mounts="$home -v $HOME/.config/aiws/dotfiles:/home/aiws/.dotfiles:ro"
@@ -92,12 +97,14 @@ case $cmd in
       hostile-sample) mounts=$home; egress=none ;;
       *) echo "unknown profile $p" >&2; exit 64 ;;
     esac
+    docker volume create "$g-home" >/dev/null
+    mkdir -p "$HOME/aiws-exchange/$g"
     if [ "$egress" = none ]; then
       net="--network none"
     else
       docker network create --internal "$g" >/dev/null
       aiws-egress "$g" "$egress"                          # proxy sidecar, §5
-      px="http://$g-proxy:3128"; np="${AIWS_NO_PROXY:-localhost,127.0.0.1}"
+      px="http://$g-proxy:3128"; np="localhost,127.0.0.1${AIWS_NO_PROXY:+,$AIWS_NO_PROXY}"
       net="--network $g -e http_proxy=$px -e https_proxy=$px -e HTTP_PROXY=$px -e HTTPS_PROXY=$px
            -e no_proxy=$np -e NO_PROXY=$np"
     fi
@@ -105,7 +112,7 @@ case $cmd in
       --cap-drop ALL --security-opt no-new-privileges:true \
       -e TERM=xterm-256color $net $mounts \
       aiws-base sleep infinity >/dev/null
-    [ "$p" = hostile-sample ] || aiws-port "$g" "${AIWS_PORT:-5000}" ;;
+    [ "$p" = hostile-sample ] || aiws-port "$g" "${AIWS_PORT:-8000}" ;;
   rm)
     p=$1; n=$2; g="aiws-$p-$n"
     docker rm -f "$g" "$g-proxy" "$g-port" >/dev/null 2>&1 || true
@@ -119,7 +126,7 @@ esac
 
 - **Repos live in the guest's home volume**, not on the host filesystem. The privileged side can't
   accidentally run git or an editor against them; it reaches them only through the `ext::` remote
-  (§10).
+  (§11).
 - **Dotfiles are mounted read-only**: nvim config, shell config, git config (no credentials), the
   global gitignore, Claude Code's global instructions. Change them once on the host and every guest
   sees it. Inside the guest, link them into place once (`ln -s ~/.dotfiles/nvim ~/.config/nvim`).
@@ -133,21 +140,22 @@ esac
   what's there.
 - **Proxy variables** are set in both cases, because tools disagree on which they read (curl, for
   one, ignores an uppercase `HTTP_PROXY`). `AIWS_NO_PROXY` adds the project's HTTP dev services
-  (§11), which would otherwise be sent to the proxy and refused.
+  (§12), which would otherwise be sent to the proxy and refused.
 - **Published ports.** Docker does not publish ports for a container that is only on an internal
-  network, so a small forwarder does it (`aiws-port`, below), bound to `127.0.0.1` and chosen per
-  guest (`AIWS_PORT`) to avoid clashes. Dev servers must listen on `0.0.0.0` *inside* the guest for
-  it to reach them (Django's dev server, for one, defaults to `127.0.0.1`). Published ports are
-  reachable from other guests' networks through the host (§12), so they should not expose anything
+  network, so a small forwarder does it (`aiws-port`, below): the host port, on `127.0.0.1`, is
+  chosen per guest (`AIWS_PORT`, default 8000) to avoid clashes, and always leads to port 8000 in
+  the guest, Django's default. Dev servers must listen on `0.0.0.0` *inside* the guest for the
+  forwarder to reach them (Django's, for one, defaults to `127.0.0.1`). Published ports are
+  reachable from other guests' networks through the host (§13), so they should not expose anything
   that trusts its callers.
 
 ```sh
 #!/bin/sh
-# ~/bin/aiws-port: aiws-port <guest> <port>
+# ~/bin/aiws-port: aiws-port <guest> <host-port>, forwarded to port 8000 in the guest.
 # Created on the bridge so its port can be published, then attached to the guest's network.
 g=$1; port=$2
-docker run -d --name "$g-port" --network bridge -p "127.0.0.1:$port:$port" \
-  alpine/socat "TCP-LISTEN:$port,fork,reuseaddr" "TCP:$g:$port" >/dev/null
+docker run -d --name "$g-port" --network bridge -p "127.0.0.1:$port:8000" \
+  alpine/socat "TCP-LISTEN:8000,fork,reuseaddr" "TCP:$g:8000" >/dev/null
 docker network connect "$g" "$g-port"
 ```
 
@@ -157,7 +165,10 @@ Egress is part of a profile's C property (SPEC.md §3) and the deployment enforc
 item 5). The mechanism for every guest with a network: **the network denies, the proxy allows.**
 
 - The guest is on an `--internal` Docker network, which has no route out. Non-HTTP TCP, UDP and
-  external DNS simply have nowhere to go; the internal network blocks them, not the proxy.
+  external DNS simply have nowhere to go; the internal network blocks them, not the proxy. The
+  guest resolves only local names; the proxy resolves the rest. **(verify)** that Docker's embedded
+  DNS does not resolve external names for an internal network: if it did, DNS queries would be a
+  way to carry data out.
 - A proxy sidecar is on that network *and* a normal one, and is the guest's only way out. The
   guest's proxy variables point at it. Honouring them is voluntary, but a process that ignores them
   has no route at all.
@@ -171,8 +182,12 @@ item 5). The mechanism for every guest with a network: **the network denies, the
 ```sh
 #!/bin/sh
 # ~/bin/aiws-egress: aiws-egress <guest> allowlist|public
-g=$1; mode=$2
-list=; [ "$mode" = allowlist ] && list="-v $HOME/.config/aiws/egress/$g.txt:/etc/squid/allow.txt:ro"
+g=$1; mode=$2; list=
+if [ "$mode" = allowlist ]; then
+  f=$HOME/.config/aiws/egress/$g.txt           # must exist: Docker would create a directory
+  [ -f "$f" ] || { echo "missing allow-list $f" >&2; exit 1; }
+  list="-v $f:/etc/squid/allow.txt:ro"
+fi
 docker run -d --name "$g-proxy" --network bridge $list \
   -v "$HOME/.config/aiws/egress/squid-$mode.conf:/etc/squid/squid.conf:ro" \
   ubuntu/squid >/dev/null
@@ -223,6 +238,8 @@ Notes:
   proxy pattern above still works there with a sidecar.
 - Denied hosts are logged by the proxy; reviewing that log is how allow-lists grow. Approval of new
   hosts through priviledge is in the backlog (SPEC.md §10).
+- An allowed host that stores data for any account can carry data out (SPEC.md §3). Keep such
+  hosts off the list where the work allows; the agent's own model API can't be.
 
 ## 6. Image
 
@@ -294,7 +311,7 @@ tmux split-window -v "priviledge serve $p $n"       # approvals for this guest
   output, which is why clipboard reads are denied and priviledge escapes agent text.
 - The terminal's `TERM` (`xterm-ghostty`, say) needs its terminfo in the image. Either
   install it or use `xterm-256color`, as in §4.
-- A privileged window holds a shell in the clean clones (§10) for review, push, deploy and project
+- A privileged window holds a shell in the clean clones (§11) for review, push, deploy and project
   compose.
 
 ## 8. Review tools (privileged side)
@@ -304,8 +321,11 @@ human configures (SPEC.md §7). They run as the privileged user over agent-autho
 choice matters:
 
 - `$PRIVILEDGE_REVIEW_PAGER` and `$PRIVILEDGE_REVIEW_EDITOR` are argv strings, run without a shell.
-- The default pager is `less` without `-R` and with `--no-lessopen`. Many systems set `LESSOPEN` to
-  a lesspipe script that runs other programs over the file.
+- The default pager is `less -+r -+R --no-lessopen`. Shell setups often export `LESS=-R`, which
+  would pass escape sequences to the terminal; `-+` resets those options whatever `LESS` says. Many
+  systems set `LESSOPEN` to a lesspipe script that runs other programs over the file.
+- The default editor, `vi`, is vim on many systems and loads the human's own vimrc and plugins,
+  with modelines on. Set `$PRIVILEDGE_REVIEW_EDITOR` explicitly rather than relying on it.
 - A minimal nvim serves as both, the pager in read-only mode:
 
   ```
@@ -316,18 +336,67 @@ choice matters:
   `NVIM_APPNAME` gives it its own configuration and plugin directories
   (`~/.config/priviledge-review/`, privileged-owned). `-u <file>` alone is not enough: nvim still
   loads plugins from the normal configuration and data directories. In that configuration: syntax
-  colouring (vim syntax or treesitter), `set nomodeline`, no plugins that execute anything, no LSP.
+  colouring (vim syntax or treesitter), `set nomodeline`, no plugins that execute anything, no LSP,
+  and `set noswapfile noundofile shada=` so that no copy of the reviewed content (unredacted
+  output, say) outlives the review.
 - Human resources (SPEC.md §8) open the same editor on an empty file for the answer.
-- Diff review before a push uses a git tool that does not run project code (§10).
+- Diff review before a push uses a git tool that does not run project code (§11).
 
-## 9. Editor, LSP and agent (inside the guest)
+## 9. Resources (privileged side)
+
+Resource executables are the human's, written to the contract and the three properties in
+SPEC.md §8. Two examples for the resources in SPEC.md's example configuration:
+
+```sh
+#!/bin/sh
+# ~/.config/priviledge/resources/aws-readonly
+# Only allow-listed operations; global options go after them. No host files, no other endpoint.
+case "$1 $2" in
+  "logs filter-log-events"|"logs describe-log-groups"|"ecs describe-services") ;;
+  *) echo "not allowed: aws $1 $2"; exit 1 ;;
+esac
+for a in "$@"; do
+  case $a in
+    *file://*|*fileb://*|--endpoint-url*) echo "not allowed: $a"; exit 1 ;;
+  esac
+done
+# Only this profile's files, and nothing from the environment that started the broker.
+exec env -i PATH="$PATH" HOME="$HOME" \
+  AWS_CONFIG_FILE="$HOME/.config/priviledge/aws/readonly.config" \
+  AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/priviledge/aws/readonly.credentials" \
+  aws "$@"
+```
+
+```sh
+#!/bin/sh
+# ~/.config/priviledge/resources/prod-db-ro
+# `sqlquery` is the human's driver-based script: one SQL statement in on stdin, sent with the
+# extended query protocol (which refuses a second one, so a SET can't lift the timeout), CSV
+# out, and the driver's own errors on stderr, for the human.
+exec env -i PATH="$PATH" HOME="$HOME" \
+  PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
+  "$HOME/.config/priviledge/bin/sqlquery" \
+  "host=... user=app_ro dbname=... options='-c statement_timeout=60s'"
+```
+
+- Both check the shape of their input, not its meaning: which operations, not which data. What the
+  credential can read is still exposed (SPEC.md §5, condition 2).
+- For tools with a large input surface, running them confined is the stronger option: a disposable
+  container that holds only this resource's credential and mounts nothing from the host
+  (SPEC.md §8).
+- **(verify)** that the aws CLI accepts global options after the operation, and that a running
+  Postgres statement can't change its own timeout.
+
+## 10. Editor, LSP and agent (inside the guest)
 
 - nvim, its plugins and every LSP server run in the guest: basedpyright/pyright,
   typescript-language-server, lua_ls, and so on. The plugin manager and mason.nvim install into the
   home volume.
 - VS Code, optionally, with Dev Containers' "Attach to Running Container", which runs the VS Code
   server and its extensions inside the guest.
-- Claude Code runs in the guest, logged in there, with its state in the home volume. Its global
+- Claude Code runs in the guest, logged in there, with its state in the home volume. That login is
+  a credential in the guest (SPEC.md §3, known issue); for `public` and `hostile-*` guests, prefer
+  an API key from a separate account or workspace with a spending limit. Its global
   `CLAUDE.md` is linked from the read-only dotfiles, so the source stays intact on the host. The
   agent could still replace the link in its own home; instructions are not a security control
   (SPEC.md §3). Its permission allow-list includes `Bash(priviledge list)`,
@@ -336,16 +405,17 @@ choice matters:
 - Browser automation (Playwright and similar) runs inside the guest as well. Chromium's own
   sandbox may not start with all capabilities dropped; Playwright then needs Chromium's
   `--no-sandbox`, leaving the guest as the boundary **(verify)**.
-- The git read-only token (SPEC.md §5) is the only native token, in the guest's git credential
-  store. Other read-only access (code host, error tracker, issue tracker) goes through priviledge
-  resources.
+- The git read-only token (SPEC.md §5) is the only native token, in a `trusted` guest's git
+  credential store. Other read-only access (code host, error tracker, issue tracker) goes through
+  priviledge resources.
 - Per-path tool state (Claude Code's per-project memory, `mise trust`, `direnv allow`) initialises
   fresh in the guest. Existing checkouts are not migrated; clone fresh.
 
-## 10. Git: clone, review, push, deploy
+## 11. Git: clone, review, push, deploy
 
-**In the guest:** clone with a **read-only** upstream token (HTTPS, stored in the guest's git
-credential store). Fetch and pull work; push is rejected by the server.
+**In the guest:** a `trusted` guest clones with a **read-only** upstream token (HTTPS, stored in
+the guest's git credential store); a `public` guest clones public repos anonymously. Fetch and pull
+work; push is rejected by the server.
 
 **On the privileged side:** a clean clone per repo, with the guest as a remote through git's
 `ext::` transport, which runs git's protocol over the same command `guest_exec` uses:
@@ -355,6 +425,7 @@ git clone git@git.example.com:org/shop-app.git ~/src-clean/shop-app
 cd ~/src-clean/shop-app
 git remote add aiws 'ext::docker exec -i aiws-trusted-shop %S /home/aiws/src/shop-app'
 git config protocol.ext.allow user
+git config transfer.fsckObjects true
 ```
 
 - `protocol.ext.allow user` allows `ext::` only for commands the human runs. git treats `ext::`
@@ -362,7 +433,8 @@ git config protocol.ext.allow user
   from fetched content, such as submodules.
 - `git fetch aiws <branch>` runs `git-upload-pack` inside the guest. On the host, git only
   receives and parses pack data, which is inert until checked out: the same trust model as
-  fetching from any remote.
+  fetching from any remote. `transfer.fsckObjects` makes git check every fetched object, and
+  refuse malformed ones, before storing it.
 - A `public` guest of the same project gets its own remote (`aiws-public`).
 
 **Two-pass review:**
@@ -388,19 +460,19 @@ git worktree add ../shop-app-deploy <reviewed-sha>         # deploys and tofu ru
 Deploying runs code written in the guest with privileges. That is the reviewed-code exception of
 SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
 
-## 11. Dev services and dev servers
+## 12. Dev services and dev servers
 
 - The human runs each project's compose from the clean clone at a reviewed commit, so review
   covers its mounts, privileges and build contexts.
-- A privileged-owned override attaches the services to the guest's network and keeps any
-  published ports on loopback:
+- A privileged-owned override moves every service onto the guest's network only, and drops its
+  published ports:
 
   ```yaml
   # ~/.config/aiws/overrides/shop-app.yml
   services:
     app-postgres:
-      networks: [default, aiws]
-      ports: !override ["127.0.0.1:5432:5432"]
+      networks: !override [aiws]
+      ports: !reset []
   networks:
     aiws:
       name: aiws-trusted-shop
@@ -408,9 +480,16 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
   ```
 
   `docker compose -f docker-compose.yml -f ~/.config/aiws/overrides/shop-app.yml up -d`
-  (`!override` needs a recent Compose **(verify)**). Create the guest first: it creates the
-  network. Services keep their own `default` network for their own egress; the guest's network is
-  internal.
+  (`!override` and `!reset` need a recent Compose **(verify)**). Create the guest first: it
+  creates the network.
+- **Why only the guest's network.** The guest can take over what it reaches: with the dev
+  database's superuser, which dev setups usually hand out, `COPY ... TO PROGRAM` runs a program
+  inside the service's container. A service that also had a normal network would give the guest
+  a route around its egress proxy, to the internet, the host's loopback and the local network.
+  On the internal network, services still reach each other by name and the daemon still pulls
+  their images; one that needs the internet at run time gives its guest that route, which is
+  never acceptable for `public`. The human reaches a dev database from the guest, or with
+  `docker compose exec` from the clean clone.
 - The guest reaches services by name (`psql -h app-postgres`). Projects that hard-code
   `localhost` need their host settings overridden in the guest's environment. HTTP services (a
   search engine on port 9200, say) also go in the guest's `AIWS_NO_PROXY` (§4), or clients send
@@ -422,12 +501,12 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
   holding real sessions.
 - Dev databases that matter get snapshots or credentials: the guest can reach them.
 
-## 12. Host exposure and hygiene
+## 13. Host exposure and hygiene
 
-- **Host loopback.** On Docker Desktop, containers on a normal network can reach services
-  listening on the host's loopback through `host.docker.internal` **(verify)**. Guests in this setup
-  are never on a normal network, and their proxies refuse private addresses (§5), but the
-  forwarders and dev-service containers are. Anything the privileged side runs on localhost, and
+- **Host loopback.** On Docker Desktop, containers on a normal network can reach services listening
+  on the host's loopback through `host.docker.internal` **(verify)**. Guests in this setup are never
+  on a normal network, nor are their dev services (§12), and their proxies refuse private addresses
+  (§5), but the proxies and forwarders are. Anything the privileged side runs on localhost, and
   every published port, is reachable from those. Audit with `lsof -nP -iTCP -sTCP:LISTEN` and make
   sure nothing sensitive listens without authentication. priviledge itself listens on nothing.
 - **No secrets in guests.** Nothing from the privileged home is mounted except the read-only
@@ -437,7 +516,7 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
 - **The global gitignore** must reach guests through the dotfiles. Otherwise personal files
   ignored only by the host's global ignore become committable.
 
-## 13. Other setups
+## 14. Other setups
 
 The same priviledge configuration works with a different `guest_exec` template per profile:
 
@@ -458,28 +537,31 @@ home to them (`chmod o-rwx ~`; they are not in the privileged user's group), and
 toolchains. For interactive panes, prefer `ssh` to loopback over `sudo -u`/`su`: on macOS `su` does
 not allocate a new terminal, so the guest shell shares the privileged pane's terminal device. The
 broker's connection has no terminal (it starts `guest_exec` detached, DESIGN.md §3), so `sudo -u` is
-fine there. For ssh: key-only logins restricted to `AllowUsers <user>@127.0.0.1 <user>@::1`, no
-forwarding of any kind, and a dedicated key installed with `restrict,pty` (on macOS, launchd starts
-sshd on all interfaces and may ignore `ListenAddress` **(verify)**). Never give such a user sudo to
-the privileged account, including for Homebrew: sudo would authenticate the guest's own password,
-which other guest processes can capture, and brew run as its owner with guest-influenced input is
-equivalent to a shell as the owner. Egress per user needs a packet filter rule keyed on uid (`pf` on
-macOS, nftables on Linux) **(verify)**.
+fine there; for the same reason sudo can't ask for a password, so it needs a `NOPASSWD` rule that
+lets the privileged user run commands as the guest user (never the other way round). For ssh:
+key-only logins restricted to `AllowUsers <user>@127.0.0.1 <user>@::1`, no forwarding of any kind,
+and a dedicated key installed with `restrict,pty` (on macOS, launchd starts sshd on all interfaces
+and may ignore `ListenAddress` **(verify)**). Never give such a user sudo to the privileged account,
+including for Homebrew: sudo would authenticate the guest's own password, which other guest
+processes can capture, and brew run as its owner with guest-influenced input is equivalent to a
+shell as the owner. Egress per user needs a packet filter rule keyed on uid (`pf` on macOS, nftables
+on Linux) **(verify)**.
 
-## 14. Verification checklist
+## 15. Verification checklist
 
 From inside a `trusted` or `public` guest:
 
-- `ls /Users` fails: no host paths.
+- `/proc/self/mountinfo` shows no host paths besides the dotfiles and the exchange directory.
 - `touch ~/.dotfiles/x` fails: dotfiles are read-only.
-- There is no runtime socket (`ls -l /var/run/docker.sock` fails) and `docker ps` fails.
+- There is no runtime socket: `find / -type s 2>/dev/null` lists nothing but the relay's.
 - `git push` to upstream is rejected by the server.
 - Other guests don't resolve (`getent hosts aiws-<other>` fails).
 - `curl https://example.com` fails (not allow-listed); `curl https://<allowed host>` works;
   `curl http://host.docker.internal:<port>` fails, directly and through the proxy.
+- `getent hosts example.com` fails: external names don't resolve in the guest.
 - An HTTP dev service listed in `AIWS_NO_PROXY` answers by name.
-- `priviledge list` shows only this profile's resources. Stopping the guest's `priviledge serve`
-  makes `request` fail fast.
+- Once the core loop exists: `priviledge list` shows only this profile's resources, and stopping
+  the guest's `priviledge serve` makes `request` fail fast.
 
 From inside a `hostile-web` guest: `curl https://example.com` works;
 `curl http://host.docker.internal` and an address on the local network both fail.
@@ -492,3 +574,5 @@ From the host:
 - The runtime's shared paths are only the dotfiles, exchange and clean-clone directories.
 - Loopback listeners reachable via `host.docker.internal` are known and acceptable.
 - The proxy's log shows only allow-listed hosts passing.
+- Dev-service containers have no route out: from the clean clone, `docker compose exec` into one
+  and try an external address and `host.docker.internal`.

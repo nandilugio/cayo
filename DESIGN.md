@@ -25,20 +25,23 @@ that guest, and each guest gets its own approval pane. The guest is identified e
 place it changes:
 
 ```
-pending-approval ──▶ executing ──▶ pending-release ──▶ deliverable ─┐
-      │                  │                │                         │
-      │ n                │ exit≠0         │ n                       │
-      ▼                  ▼                ▼                         │
-   denied             failed        release-denied                  ├──▶ retrieved: deleted
-      │                  │                │                         │
-      └──────────────────┴────────────────┴─────────────────────────┤
-pending-approval ──▶ dropped  (channel lost) ───────────────────────┘
+pending-approval ──▶ executing ──▶ pending-release ──▶ deliverable (exit 0) ─┐
+      │                                   │        └─▶ failed (exit≠0) ──────┤
+      │ n                                 │ n                                │
+      ▼                                   ▼                                  │
+   denied                           release-denied                           ├──▶ retrieved: deleted
+      │                                   │                                  │
+      └───────────────────────────────────┴──────────────────────────────────┤
+pending-approval ──▶ dropped  (channel lost) ────────────────────────────────┘
 ```
 
 - A request enters `pending-approval` on arrival; the client gets its id at once. With
-  `confirm_request = false` it enters `executing` directly, and with `confirm_output = false` (or
-  the human's `Y`) a successful execution goes straight to `deliverable`. Checkers, later, run on
-  entering `pending-approval`.
+  `confirm_request = false` it is not prompted, and enters `executing` when its turn comes
+  (below). With `confirm_output = false` (or the human's `Y`) execution goes straight to
+  `deliverable` or `failed`, by exit status. Checkers, later, run on entering `pending-approval`.
+- Failures are reviewed like results: stdout may hold partial data, such as rows written before a
+  timeout. A failed execution skips review only when there is nothing to review: its stdout is
+  empty, or it was killed at the output cap (§5).
 - The five states that lead to `retrieved` are **terminal**: the request is settled (SPEC.md §6) and
   holds whatever `retrieve` will answer: the result, the resource's stdout on failure, or the
   human's message. `retrieve` is a pull, so no state is needed for a delivery that breaks off: the
@@ -51,7 +54,7 @@ pending-approval ──▶ dropped  (channel lost) ─────────�
 running resource's stdout and stderr, the terminal, and a heartbeat timer. "The prompt queue" and
 "the outbox" are views over state (requests in a `pending-*` state in arrival order; requests in a
 terminal state), not separate structures. Requests run one at a time (SPEC.md §7): the next
-request, prompted or auto-approved, starts only when no request is `executing` or
+request is prompted, or if auto-approved started, only when no request is `executing` or
 `pending-release`.
 
 The review pager and editor take over the terminal, but the loop keeps running underneath them:
@@ -70,7 +73,10 @@ At start, `serve <profile> <name>`:
 
 1. Loads `config.toml` (SPEC.md §8) after checking ownership and permissions.
 2. Substitutes `{profile}` and `{name}` in the profile's `guest_exec`. `name` must match
-   `[A-Za-z0-9][A-Za-z0-9._-]*`, so it cannot alter the command's shape.
+   `[A-Za-z0-9][A-Za-z0-9._]*`, so it cannot alter the command's shape. It excludes `-`, which
+   profile names may contain, so that `<profile>-<name>` (container names, audit files) splits
+   only one way: otherwise profile `a` with guest `b-c` and profile `a-b` with guest `c` would
+   name the same guest.
 3. Builds the guest's resource table from the profile's `resources` table: each entry's resource
    definition plus that entry's `confirm_request`/`confirm_output` (default `true`). An entry for
    an undefined resource, or `confirm_request = false` on a resource with `write_credential`, is
@@ -150,8 +156,10 @@ on this guest's channel *is* this guest.
 
 Requests live in the broker's memory, keyed by id. An id is `<run>-<request>`: the broker run's
 id (§8) and ten random base32 characters (50 bits) from the operating system's random source. No
-uniqueness check is kept: only ids within one run can collide, since the run prefix separates
-runs, and even an unusually busy run of 10,000 requests has a collision chance around 4 × 10⁻⁸.
+uniqueness check is kept. Within a run, even an unusually busy run of 10,000 requests has a
+collision chance around 4 × 10⁻⁸. The run prefix separates runs, but it is random too: two runs
+of one guest share a run id with a chance around 5 × 10⁻⁴ over a thousand runs, and then a stale
+id is reported as unknown (252) instead of lost. Both sizes get tuned during development (§12).
 Random rather than sequential, an id tells an agent nothing about other sessions' requests, and a
 mistyped or stale id practically never lands on someone else's. The prompt shows only the request
 part. `wait` or `retrieve` for an id from an earlier run answers 248 (lost), with the audit log's
@@ -163,8 +171,10 @@ writing the last byte to its stdout without error, and only then does the broker
 
 **Results are spooled, not held.** A resource's stdout is captured with
 `tempfile.SpooledTemporaryFile`: in memory up to a threshold (1 MiB), then rolled over to a file in
-the broker's private temp directory (§8). `view` rolls it over and opens that file, so the review
-copy is the capture itself. Output stops at a per-request cap (default 64 MiB): the resource is
+the broker's private temp directory (§8). A rolled-over spool file has no path, so the prompt's
+head/tail preview reads the spool, and `view` and `edit` first write a named copy, with the
+extension from `output_syntax`, into the same directory. An edited copy becomes the released
+result. Output stops at a per-request cap (default 64 MiB): the resource is
 killed, the partial output is discarded, and the request becomes `failed`: `retrieve` exits 1 with
 empty stdout and a `priviledge:` line on stderr telling the agent to narrow its request. Memory
 stays flat whatever the result size, and waiting results cost disk, not RAM.
@@ -225,17 +235,20 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
 
 ## 9. Technology
 
-- **Language: Python**, with a **pinned runtime shipped via uv** (a uv-managed interpreter, or a
-  bundle via shiv/pex), so there is no dependency on the stock system Python and no version matrix
-  to support.
+- **Language: Python**, with a **pinned interpreter managed by uv**, so there is no dependency on
+  the stock system Python and no version matrix to support. A self-contained executable that needs
+  nothing installed (pex's scie output or PyInstaller embed the interpreter) is a packaging option
+  to evaluate when priviledge is distributed.
 - Standard library only at runtime: `socket`, `selectors`, `subprocess`, `json`, `csv`, `base64`,
   `argparse`, `tomllib`, `hashlib`, `shlex`, `tempfile`, `pwd`, `secrets`. No third-party runtime
   dependencies. Formatting in the inline prompt is stdlib-only (SPEC.md §7's review-surface rule);
   anything richer is the external pager or editor.
 - **Rust is a deliberate later option, not now.** priviledge's untrusted input is JSON over the
-  channel (stdlib `json`, memory-safe) that is mostly passed through to subprocesses; the
-  security-critical logic is process and permission handling, not parsing. A Rust rewrite fits as
-  a "once the design stops changing" step.
+  channel, mostly passed through to subprocesses; the security-critical logic is process and
+  permission handling, not parsing. The stdlib `json` scanner (and `base64`'s) is C, the one
+  native component exposed to guest bytes; it is mature and widely exercised. If that ever needs
+  removing, the stdlib's pure-Python scanner can be forced, at some cost in speed. A Rust rewrite
+  fits as a "once the design stops changing" step.
 
 ## 10. Session resources (backlog)
 
@@ -268,6 +281,10 @@ ships (SPEC.md §10).
 
 - The default caps in §6 (payload, outstanding requests, connections) are guesses to tune in use.
 - Heartbeat and timeout defaults (10 s / 30 s) are guesses to tune in use.
+- The sizes of the run id (6 base32 characters) and of the request part (10), tuned against real
+  request and restart counts (§5).
+- Guest names without `-` (§2) are a stopgap; a separator that needs no restriction on names is
+  still to be found.
 - **(verify)** what the relay sees when `serve` is killed hard, per runtime (end-of-file or
   nothing). The heartbeat covers both, but it tells us how long orphans linger.
 - Session resources: sentinel robustness, prompt noise, long-running statements, cancellation.
