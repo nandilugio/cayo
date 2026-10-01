@@ -86,7 +86,7 @@ cmd=$1; shift
 case $cmd in
   new)
     p=$1; n=$2; g="aiws-$p-$n"
-    case $n in
+    case $n in                                 # this helper's naming needs it; priviledge doesn't
       ''|*-*) echo "guest names can't be empty or contain '-'" >&2; exit 64 ;;
     esac
     home="-v $g-home:/home/aiws -v $HOME/aiws-exchange/$g:/home/aiws/exchange"
@@ -217,7 +217,7 @@ http_access allow all
 # ~/.config/aiws/egress/aiws-trusted-shop.txt
 .anthropic.com
 .githubusercontent.com
-.pypi.org
+pypi.org
 .pythonhosted.org
 .npmjs.org
 ...
@@ -238,8 +238,10 @@ Notes:
   proxy pattern above still works there with a sidecar.
 - Denied hosts are logged by the proxy; reviewing that log is how allow-lists grow. Approval of new
   hosts through priviledge is in the backlog (SPEC.md §10).
-- An allowed host that stores data for any account can carry data out (SPEC.md §3). Keep such
-  hosts off the list where the work allows; the agent's own model API can't be.
+- An allowed host that stores data for any account can carry data out (SPEC.md §3), and in
+  `trusted` the list also decides what strangers' text the agent reads. Keep such hosts off it
+  where the work allows (`.pypi.org` includes `upload.pypi.org`; prefer `files.pythonhosted.org`
+  for installs); the agent's own model API can't be.
 
 ## 6. Image
 
@@ -360,11 +362,11 @@ for a in "$@"; do
     *file://*|*fileb://*|--endpoint-url*) echo "not allowed: $a"; exit 1 ;;
   esac
 done
-# Only this profile's files, and nothing from the environment that started the broker.
-exec env -i PATH="$PATH" HOME="$HOME" \
-  AWS_CONFIG_FILE="$HOME/.config/priviledge/aws/readonly.config" \
-  AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/priviledge/aws/readonly.credentials" \
-  aws "$@"
+# Only this profile's files. The broker's fixed environment (SPEC.md §8) keeps any AWS_* the
+# human exported out of here.
+AWS_CONFIG_FILE="$HOME/.config/priviledge/aws/readonly.config" \
+AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/priviledge/aws/readonly.credentials" \
+  exec aws "$@"
 ```
 
 ```sh
@@ -373,9 +375,8 @@ exec env -i PATH="$PATH" HOME="$HOME" \
 # `sqlquery` is the human's driver-based script: one SQL statement in on stdin, sent with the
 # extended query protocol (which refuses a second one, so a SET can't lift the timeout), CSV
 # out, and the driver's own errors on stderr, for the human.
-exec env -i PATH="$PATH" HOME="$HOME" \
-  PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
-  "$HOME/.config/priviledge/bin/sqlquery" \
+PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
+  exec "$HOME/.config/priviledge/bin/sqlquery" \
   "host=... user=app_ro dbname=... options='-c statement_timeout=60s'"
 ```
 

@@ -156,6 +156,10 @@ Two consequences worth stating:
 - **Open-source work is not the safe middle.** Reading strangers' text (A), holding credentials
   to one's own repos (B) and pushing or commenting (C) is the full set in one session by default;
   `public` breaks it by keeping every write behind approval and no write credential in the guest.
+- **In `trusted`, the allow-list limits A as well as C-egress.** What the agent reads from the
+  network (package pages, raw files on a code host) is strangers' text too, and any allowed host
+  that accepts uploads from any account is a way out. Unattended prod reads (`confirm_output =
+  false`) are only as safe as that list: keep hosts that store data off it, or review the output.
 - **Hostile content is handled by removing B, not by trusting filters.** For `hostile-web` the
   task needs broad egress, so the guest holds nothing worth taking; the host and the local network
   stay out of reach, since services there are something worth taking too. For samples, egress
@@ -543,14 +547,13 @@ environment variables, and, if `args = true`, the extra arguments as argv. The a
 any other part of its environment. It fetches its own secrets with whatever the OS provides (macOS
 `security`, Linux `secret-tool`, `pass`, `op read`, ...).
 
-**Known risk: the inherited environment.** Apart from those parameters, a resource inherits the
-broker's environment, i.e. whatever was exported in the shell that started `serve`. Many tools
-let the environment choose their credential and configuration (for the AWS CLI, variables like
-`AWS_ACCESS_KEY_ID` override its credentials file; libpq reads `PG*` variables). An admin key
-exported for some unrelated task would then reach every resource, and a read-only resource that
-auto-approves would silently run with it. So a resource should start its tool from an empty
-environment (`env -i`, passing on only what the tool needs), as SETUP.md's examples do. Whether
-the broker should do this itself is an open question (§11).
+**The environment is fixed, not inherited.** A resource gets `PATH`, `HOME`, `USER`, the locale
+variables and its `PRIVILEDGE_P_*` parameters, and nothing else from the shell that started
+`serve`. Many tools let the environment choose their credential and configuration (for the AWS
+CLI, variables like `AWS_ACCESS_KEY_ID` override its credentials file; libpq reads `PG*`
+variables), so an admin key exported there for some unrelated task would otherwise reach every
+resource, and a read-only one that auto-approves would silently run with it. A resource that
+needs more (an agent socket, a tool's own variables) sets it itself.
 
 Resource executables must reference only privileged-owned files. A script taken from a project
 (for example a repo's `bin/console`) is used from a privileged clean clone at a reviewed
@@ -673,9 +676,6 @@ document may still change, `1.0` when they stop.
 
 - Which SaaS tokens can actually be scoped read-only (trackers, code hosts, chat) **(verify)**.
 - Cancelling a running request from the approval prompt, and whether resources need a timeout.
-- Whether the broker should run resources with a fixed environment instead of its own (§8, the
-  inherited environment). It would close that risk for every resource, at the cost of each one
-  setting what it needs.
 - Head/tail preview size in the approval prompt.
 - Whether requests should survive a broker restart. For now they don't; the audit log is the
   record.

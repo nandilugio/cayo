@@ -63,9 +63,10 @@ buffered until the tool exits. Otherwise a minute in the pager would let the rel
 lapse.
 
 Resources run as child processes of the broker, in their own session without a controlling
-terminal, with stdin, stdout and stderr connected to the request. They can't prompt on, or write
-to, the approval pane. The broker collects stdout as the result and stderr for the pane and the
-log (SPEC.md §8, the resource contract).
+terminal, with stdin, stdout and stderr connected to the request, and with the fixed environment
+of SPEC.md §8 (`PATH`, `HOME`, `USER`, `LANG`/`LC_*`, `PRIVILEDGE_P_*`) built from scratch rather
+than filtered. They can't prompt on, or write to, the approval pane. The broker collects stdout as
+the result and stderr for the pane and the log (SPEC.md §8, the resource contract).
 
 ## 2. Configuration resolution
 
@@ -73,10 +74,7 @@ At start, `serve <profile> <name>`:
 
 1. Loads `config.toml` (SPEC.md §8) after checking ownership and permissions.
 2. Substitutes `{profile}` and `{name}` in the profile's `guest_exec`. `name` must match
-   `[A-Za-z0-9][A-Za-z0-9._]*`, so it cannot alter the command's shape. It excludes `-`, which
-   profile names may contain, so that `<profile>-<name>` (container names, audit files) splits
-   only one way: otherwise profile `a` with guest `b-c` and profile `a-b` with guest `c` would
-   name the same guest.
+   `[A-Za-z0-9][A-Za-z0-9._-]*`, so it cannot alter the command's shape.
 3. Builds the guest's resource table from the profile's `resources` table: each entry's resource
    definition plus that entry's `confirm_request`/`confirm_output` (default `true`). An entry for
    an undefined resource, or `confirm_request = false` on a resource with `write_credential`, is
@@ -223,8 +221,10 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
 
 - Config and state follow the **XDG Base Directory** spec on the privileged side:
   `$XDG_CONFIG_HOME/priviledge` (config, SPEC.md §8), `$XDG_STATE_HOME/priviledge` (audit logs).
-- Audit log: `$XDG_STATE_HOME/priviledge/<profile>-<name>.jsonl`, one JSON line per request step,
-  each carrying the request id (SPEC.md §9). `profile/name` is unique only while the guest exists
+- Audit log: `$XDG_STATE_HOME/priviledge/<profile>/<name>.jsonl`, one JSON line per request step,
+  each carrying the request id (SPEC.md §9). A directory per profile keeps names apart without
+  restricting them: `a/b-c` and `a-b/c` would collide in a single flat name. `profile/name` is
+  unique only while the guest exists
   (the runtime enforces it: container names, VM names, user names), and a guest recreated with the
   same name shares the file, so each `serve` start writes a start record with a **run id** (a
   random six-character base32 token; the record also carries the start time) and every entry
@@ -283,8 +283,6 @@ ships (SPEC.md §10).
 - Heartbeat and timeout defaults (10 s / 30 s) are guesses to tune in use.
 - The sizes of the run id (6 base32 characters) and of the request part (10), tuned against real
   request and restart counts (§5).
-- Guest names without `-` (§2) are a stopgap; a separator that needs no restriction on names is
-  still to be found.
 - **(verify)** what the relay sees when `serve` is killed hard, per runtime (end-of-file or
   nothing). The heartbeat covers both, but it tells us how long orphans linger.
 - Session resources: sentinel robustness, prompt noise, long-running statements, cancellation.
