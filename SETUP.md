@@ -43,9 +43,7 @@ host: privileged side                         Docker VM
 Any runtime with a Docker-compatible CLI works: Docker Desktop, colima, Podman. priviledge only
 needs `exec -i`.
 
-- **Licensing:** Docker Desktop is free for personal use and for companies with fewer than 250
-  employees *and* less than $10M revenue; beyond that it needs a paid subscription. colima and
-  Podman are free. OrbStack is paid for commercial use.
+- **Licensing:** Docker Desktop's licence depends on your situation; colima and Podman are free.
 - **File sharing:** restrict the runtime's shared host paths to what containers actually mount:
   the dotfiles and exchange directories (§4), and the clean-clone paths that project compose files
   bind-mount (§12). Not all of `/Users`. If a guest escaped into the runtime's VM, it would reach
@@ -138,8 +136,8 @@ esac
   there that point at host paths: a host tool that follows one reads or overwrites the host file.
   Don't write into the directory over existing names, and check with `ls -l` before opening
   what's there.
-- **Proxy variables** are set in both cases, because tools disagree on which they read (curl, for
-  one, ignores an uppercase `HTTP_PROXY`). `AIWS_NO_PROXY` adds the project's HTTP dev services
+- **Proxy variables** are set in both spellings, because tools disagree on which they read (curl,
+  for one, ignores an uppercase `HTTP_PROXY`). `AIWS_NO_PROXY` adds the project's HTTP dev services
   (§12), which would otherwise be sent to the proxy and refused.
 - **Published ports.** Docker does not publish ports for a container that is only on an internal
   network, so a small forwarder does it (`aiws-port`, below): the host port, on `127.0.0.1`, is
@@ -228,20 +226,17 @@ Notes:
 - **(verify)** on Docker Desktop: that a container on an `--internal` network cannot reach
   `host.docker.internal`, that the proxy and the forwarder are reachable from it, and that the
   forwarder's published port reaches the guest.
-- Squid is the boring choice. **iron-proxy** is the purpose-built alternative when **credential
-  injection** is wanted: the guest holds a placeholder token and the proxy swaps in the real one at
-  egress, so a native token (git's, SPEC.md §5) never enters the guest. It terminates TLS, so
-  every client in the guest must trust its CA.
-- **mitmproxy** is for *observing* what a guest or a sample tries to reach, in `hostile-*` guests;
-  its allow-list options are not designed as a default-deny firewall.
-- Apple `container` (macOS 26) has a blocklist but no egress allow-list yet **(verify)**; the
-  proxy pattern above still works there with a sidecar.
+- Squid is the boring choice. iron-proxy is the alternative when credential injection is wanted
+  (the guest holds a placeholder token, the proxy swaps in the real one at egress, so git's native
+  token, SPEC.md §5, never enters the guest), at the cost of terminating TLS: every client in the
+  guest must trust its CA.
 - Denied hosts are logged by the proxy; reviewing that log is how allow-lists grow. Approval of new
   hosts through priviledge is in the backlog (SPEC.md §10).
 - An allowed host that stores data for any account can carry data out (SPEC.md §3), and in
   `trusted` the list also decides what strangers' text the agent reads. Keep such hosts off it
-  where the work allows (`.pypi.org` includes `upload.pypi.org`; prefer `files.pythonhosted.org`
-  for installs); the agent's own model API can't be.
+  where the work allows: `pypi.org` without the leading dot excludes `upload.pypi.org`, and pip
+  downloads from `files.pythonhosted.org`. Where one host serves both, as npm's registry does, and
+  for the agent's own model API, output review is the control.
 
 ## 6. Image
 
@@ -455,7 +450,7 @@ git config transfer.fsckObjects true
 git fetch aiws feature-x
 git log -p origin/develop..aiws/feature-x                  # or Sublime Merge
 git push origin aiws/feature-x:refs/heads/feature-x        # full destination ref: the source is a remote-tracking branch
-git worktree add ../shop-app-deploy <reviewed-sha>         # deploys and tofu run from here
+git worktree add ../shop-app-deploy <reviewed-sha>         # deploys run from here
 ```
 
 Deploying runs code written in the guest with privileges. That is the reviewed-code exception of
@@ -524,7 +519,7 @@ The same priviledge configuration works with a different `guest_exec` template p
 | Setup | `guest_exec` | Notes |
 |---|---|---|
 | Docker / colima / Podman (this document) | `docker exec -i aiws-{profile}-{name}` | VM boundary to the host on macOS |
-| Apple `container` (macOS 26) | `container exec -i aiws-{profile}-{name}` **(verify)** | One lightweight VM per container: a VM boundary between guests too. Same OCI images. No egress allow-list yet (§5) |
+| Apple `container` (macOS 26) | `container exec -i aiws-{profile}-{name}` **(verify)** | One lightweight VM per container: a VM boundary between guests too. Same OCI images. A blocklist but no egress allow-list yet **(verify)**; the proxy sidecar of §5 still works |
 | Lima VM | `limactl shell aiws-{profile}-{name}` or `ssh` **(verify)** | Full VM per guest; the agent can run its own Docker inside |
 | Docker Sandboxes | its exec command, if it has one **(verify)** | microVM per sandbox with its own egress proxy; mounts the host project directory |
 | Separate OS user | `ssh aiws-{profile}-{name}@127.0.0.1` or `sudo -u aiws-{profile}-{name}` | See below |
@@ -533,7 +528,7 @@ The same priviledge configuration works with a different `guest_exec` template p
 Docker daemon runs as root. A container escape is then a host compromise. Prefer rootless Docker
 or Podman, a sandboxed runtime (gVisor, Kata), or VMs.
 
-**Separate OS user** (the lightest option, no runtime): one user per guest; close the privileged
+**Separate OS user** (the only option with no runtime): one user per guest; close the privileged
 home to them (`chmod o-rwx ~`; they are not in the privileged user's group), and give each its own
 toolchains. For interactive panes, prefer `ssh` to loopback over `sudo -u`/`su`: on macOS `su` does
 not allocate a new terminal, so the guest shell shares the privileged pane's terminal device. The
@@ -545,8 +540,9 @@ and a dedicated key installed with `restrict,pty` (on macOS, launchd starts sshd
 and may ignore `ListenAddress` **(verify)**). Never give such a user sudo to the privileged account,
 including for Homebrew: sudo would authenticate the guest's own password, which other guest
 processes can capture, and brew run as its owner with guest-influenced input is equivalent to a
-shell as the owner. Egress per user needs a packet filter rule keyed on uid (`pf` on macOS, nftables
-on Linux) **(verify)**.
+shell as the owner. Its weak point is egress: restricting it per user needs packet-filter rules
+keyed on uid (`pf` on macOS, nftables on Linux) **(verify)**, so until those exist it cannot make a
+`public` profile real (SPEC.md §4, item 5).
 
 ## 15. Verification checklist
 
@@ -567,7 +563,8 @@ From inside a `trusted` or `public` guest:
 From inside a `hostile-web` guest: `curl https://example.com` works;
 `curl http://host.docker.internal` and an address on the local network both fail.
 
-From inside a `hostile-sample` guest: no network at all (`getent hosts example.com` fails).
+From inside a `hostile-sample` guest: no network at all (`ip route` shows nothing, and `curl` to
+any address fails at once).
 
 From the host:
 
