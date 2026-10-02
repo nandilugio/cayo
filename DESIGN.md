@@ -269,8 +269,9 @@ ships (SPEC.md §10).
    *inside* the real boundary surfaces the true frictions instead of guessing them.
 2. **Core loop, minimal:** `serve` with configuration resolution, the channel and relay, one exec
    resource, `request`/`wait`/`retrieve` and the sequential prompt with both confirmations.
-   Against a local dev database. The channel parser and schema checks are fuzzed with malformed
-   and adversarial input from this iteration on.
+   Against a local dev database, with the Postgres example resource of SETUP.md §9 built and
+   tested here. The channel parser and schema checks are fuzzed with malformed and adversarial
+   input from this iteration on.
 3. **Core loop, complete:** `list`, `describe`, `pending`, `cancel`, output review with the
    external pager and editor, the audit log, a read-only cloud resource.
 4. **Git and deploy flow** (SETUP.md): clean clones, the `ext::` remote, push and deploy from a

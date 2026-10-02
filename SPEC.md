@@ -402,6 +402,10 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact
   path appended as the last argument. The defaults are `less -+r -+R --no-lessopen` (raw control
   characters off even if the `LESS` variable turns them on, input preprocessor disabled) and `vi`.
   Both load the human's own settings for those tools; SETUP.md describes safe choices.
+- The two settings may name the same program. They are separate because viewing is the common
+  case and deserves the smallest surface (a pager interprets nothing and streams any size), and
+  because a viewer can't change what is being approved. An **edit is a change in content**: a
+  file saved unchanged counts as a view, and the agent gets no edit notice for it.
 
 ### Review surfaces run as privileged over hostile content
 

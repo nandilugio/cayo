@@ -397,12 +397,15 @@ choice matters:
   and `set noswapfile noundofile shada=` so that no copy of the reviewed content (unredacted
   output, say) outlives the review.
 - Human resources (SPEC.md §8) open the same editor on an empty file for the answer.
-- Diff review before a push uses a git tool that does not run project code (§11).
+- Diff review before a push (§11) is the human's own tooling, outside priviledge, under the same
+  rule: no tool that runs project code.
 
 ## 9. Resources (privileged side)
 
 Resource executables are the human's, written to the contract and the three properties in
-SPEC.md §8. Two examples for the resources in SPEC.md's example configuration:
+SPEC.md §8. The repository will carry complete, tested examples under `examples/resources/`, to
+copy into `~/.config/priviledge/resources/` and adapt; the two below are for the resources in
+SPEC.md's example configuration.
 
 ```sh
 #!/bin/sh
@@ -435,6 +438,13 @@ PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
   "host=... user=app_ro dbname=... options='-c statement_timeout=60s'"
 ```
 
+- `sqlquery` is a single-file Python script run by uv, with its database driver pinned inline
+  (`#!/usr/bin/env -S uv run --script`): the standard library has no Postgres driver, and the
+  dependency belongs to this resource, not to priviledge. It reads one statement from stdin, sends
+  it as a prepared statement (the extended query protocol, which refuses a second statement, so a
+  `SET` can't lift the timeout), writes CSV to stdout, forwards the server's own error message to
+  stdout (a syntax error or an unknown column is useful to the agent and names no host), and keeps
+  connection errors on stderr. It is built and tested in the core-loop iteration (DESIGN.md §11).
 - Both check the shape of their input, not its meaning: which operations, not which data. What the
   credential can read is still exposed (SPEC.md §5, condition 2).
 - For tools with a large input surface, running them confined is the stronger option: a disposable
@@ -458,6 +468,19 @@ PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
 - Browser automation (Playwright and similar) runs inside the guest as well. Chromium's own
   sandbox may not start with all capabilities dropped; Playwright then needs Chromium's
   `--no-sandbox`, leaving the guest as the boundary **(verify)**.
+- **Helping the agent's browser by hand** (logging into a restricted test account, getting it to
+  the right page) means seeing and driving a browser that lives in the guest. The browser must
+  stay there: one on the privileged side driven from the guest over CDP or Playwright's server
+  would execute guest commands on the host (`file://` URLs, downloads to host paths, any URL),
+  the reverse of the rendering exception in §12, and a way around egress. So the guest's browser
+  runs headed under Xvfb, a VNC server with noVNC serves its screen on a second forwarded port,
+  and the human drives it from the host browser: what reaches the host is noVNC's page, the same
+  exception as a dev server **(verify)**. A lighter variant to try first: Chromium's remote
+  debugging port through the forwarder, with the host browser's inspector screencast for seeing
+  and clicking **(verify)**. Self-signed dev certificates need no interaction
+  (`ignoreHTTPSErrors`). What the human types into that browser, the test account's password,
+  becomes a credential in the guest: a native grant under SPEC.md §5, acceptable because the
+  account's rights are restricted server-side.
 - The git read-only token (SPEC.md §5) is the only native token, in a `trusted` guest's git
   credential store. Other read-only access (code host, error tracker, issue tracker) goes through
   priviledge resources.
