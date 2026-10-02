@@ -272,7 +272,7 @@ Initial placement (to be confirmed per service):
 | Consoles and shells on remote hosts | Session resources (backlog, §10), always ask | Full power once inside |
 | Browser-only surfaces | Human resource (§8) | The human performs the step and returns the result |
 
-Hosted OAuth connectors (e.g. claude.ai integrations) run outside the machine and request
+Hosted connectors (an assistant's cloud integrations) run outside the machine and request
 whatever scopes the connector defines, often including write. They cannot be mediated from the
 host at all; the only control is whether the account has them.
 
@@ -316,8 +316,8 @@ priviledge wait "$a" "$b" && priviledge retrieve "$a" | jq ... && priviledge ret
   `.sql` file or a Python script) is read by the *client* and sent as content. The broker never
   opens workspace paths, and never writes into them: the agent redirects `retrieve`'s stdout where
   it wants it.
-- `wait` with a timeout exists because agent shell tools have hard timeouts (Claude Code's Bash
-  tool: 2 min default, 10 min max). A timed-out `wait` changes nothing: the agent waits again.
+- `wait` with a timeout exists because agent shell tools have hard timeouts (two minutes by
+  default in some, ten at most). A timed-out `wait` changes nothing: the agent waits again.
 - A client that exits does not cancel its request. `pending` recovers ids the agent lost.
 - **Request ids are opaque and random** (for example `k7f2qa-3mxp9dq2vt`). They are long enough
   that in practice they don't repeat for a guest, not even across broker restarts, and they say

@@ -16,7 +16,7 @@ Terms (guest, profile, privileged side, broker) are as defined in
 host: privileged side                         Docker VM
 ┌─────────────────────────────────────────┐   ┌──────────────────────────────────┐
 │ terminal + tmux                         │   │ guest aiws-trusted-shop          │
-│   panes: docker exec -it … aiws-…       │──▶│   nvim + LSP, claude, tests,     │
+│   panes: docker exec -it … aiws-…       │──▶│   nvim + LSP, agent, tests,      │
 │   pane:  priviledge serve trusted shop  │──▶│   dev servers, priviledge relay  │
 │ secrets, priviledge config              │   │   repos in a volume              │
 │ clean clones (review, push, deploy)     │   │   dotfiles mounted read-only     │
@@ -34,7 +34,9 @@ host: privileged side                         Docker VM
 - On macOS, all containers run inside the runtime's Linux VM, so the host is behind a VM boundary.
   Guests are separated from each other by kernel namespaces inside that VM, which is weaker but
   adequate for project-vs-project trust. It is not adequate for `hostile-sample` guests, which run
-  exploit material next to the trusted guests' kernel: run those in a separate VM (§14).
+  exploit material next to the trusted guests' kernel: those need a separate VM (§14). The same is
+  advisable for `hostile-web`, where a hostile page would have to chain a browser exploit and a
+  kernel exploit to get that far.
 - The privileged side drives guests only through the runtime's CLI, and never runs code written in
   a guest except reviewed code at a pinned commit (§11, §12).
 
@@ -78,55 +80,100 @@ inside it.
 
 ```sh
 #!/bin/sh
-# ~/bin/aiws: aiws new <profile> <name> | aiws rm <profile> <name> | aiws <profile> <name> [cmd...]
+# ~/bin/aiws: create, remove and enter guests.
+#   aiws new  <profile> <name>            create the guest aiws-<profile>-<name>
+#   aiws rm   <profile> <name>            remove it, with its network, sidecars and home volume
+#   aiws exec <profile> <name> [cmd...]   run a command in it (default: a shell)
+# Profiles are the ones in priviledge's configuration (SPEC.md §8). Here each one is a container
+# shape: what is mounted, and how the guest reaches the network.
 set -e
-cmd=$1; shift
-case $cmd in
-  new)
-    p=$1; n=$2; g="aiws-$p-$n"
-    case $n in                                 # this helper's naming needs it; priviledge doesn't
-      ''|*-*) echo "guest names can't be empty or contain '-'" >&2; exit 64 ;;
-    esac
-    home="-v $g-home:/home/aiws -v $HOME/aiws-exchange/$g:/home/aiws/exchange"
-    case $p in
-      trusted|public) mounts="$home -v $HOME/.config/aiws/dotfiles:/home/aiws/.dotfiles:ro"
-                      egress=allowlist ;;
-      hostile-web)    mounts=$home; egress=public ;;
-      hostile-sample) mounts=$home; egress=none ;;
-      *) echo "unknown profile $p" >&2; exit 64 ;;
-    esac
-    docker volume create "$g-home" >/dev/null
-    mkdir -p "$HOME/aiws-exchange/$g"
-    if [ "$egress" = none ]; then
-      net="--network none"
-    else
-      docker network create --internal "$g" >/dev/null
-      aiws-egress "$g" "$egress"                          # proxy sidecar, §5
-      px="http://$g-proxy:3128"; np="localhost,127.0.0.1${AIWS_NO_PROXY:+,$AIWS_NO_PROXY}"
-      net="--network $g -e http_proxy=$px -e https_proxy=$px -e HTTP_PROXY=$px -e HTTPS_PROXY=$px
-           -e no_proxy=$np -e NO_PROXY=$np"
-    fi
-    docker run -d --name "$g" --hostname "$g" --init \
-      --cap-drop ALL --security-opt no-new-privileges:true \
-      -e TERM=xterm-256color $net $mounts \
-      aiws-base sleep infinity >/dev/null
-    [ "$p" = hostile-sample ] || aiws-port "$g" "${AIWS_PORT:-8000}" ;;
-  rm)
-    p=$1; n=$2; g="aiws-$p-$n"
-    docker rm -f "$g" "$g-proxy" "$g-port" >/dev/null 2>&1 || true
-    docker network rm "$g" >/dev/null 2>&1 || true
-    docker volume rm "$g-home" ;;
-  *)
-    p=$cmd; n=$1; shift; [ $# -gt 0 ] || set -- zsh
-    exec docker exec -it -w /home/aiws/src "aiws-$p-$n" "$@" ;;
+
+usage() { echo "usage: aiws new|rm|exec <profile> <name> [cmd...]" >&2; exit 64; }
+
+command=${1:-}; profile=${2:-}; name=${3:-}
+[ -n "$profile" ] && [ -n "$name" ] || usage
+shift 3
+case $name in
+  *-*) echo "aiws: guest names can't contain '-' (this helper's naming needs it)" >&2; exit 64 ;;
+esac
+guest="aiws-$profile-$name"        # the container; also the prefix of its network and sidecars
+home_volume="$guest-home"
+exchange_dir="$HOME/aiws-exchange/$guest"
+dotfiles_dir="$HOME/.config/aiws/dotfiles"
+
+new_guest() {
+  # 1. What the profile decides: the mounts, and the egress mode (§5).
+  mounts="-v $home_volume:/home/aiws -v $exchange_dir:/home/aiws/exchange"
+  case $profile in
+    trusted|public) mounts="$mounts -v $dotfiles_dir:/home/aiws/.dotfiles:ro"; egress=allowlist ;;
+    hostile-web)    egress=public ;;
+    hostile-sample) egress=none ;;
+    *) echo "aiws: unknown profile $profile" >&2; exit 64 ;;
+  esac
+
+  # 2. Storage: the home volume and the per-guest exchange directory.
+  docker volume create "$home_volume" >/dev/null
+  mkdir -p "$exchange_dir"
+
+  # 3. Network: none at all, or an internal network whose only way out is the proxy sidecar.
+  if [ "$egress" = none ]; then
+    network="--network none"
+  else
+    docker network create --internal "$guest" >/dev/null
+    aiws-egress "$guest" "$egress"                                   # the proxy sidecar, §5
+    proxy="http://$guest-proxy:3128"
+    no_proxy="localhost,127.0.0.1${AIWS_NO_PROXY:+,$AIWS_NO_PROXY}"  # HTTP dev services, §12
+    network="--network $guest \
+      -e http_proxy=$proxy -e https_proxy=$proxy -e HTTP_PROXY=$proxy -e HTTPS_PROXY=$proxy \
+      -e no_proxy=$no_proxy -e NO_PROXY=$no_proxy"
+  fi
+
+  # 4. The guest: no capabilities, no privilege escalation, idle until something execs into it.
+  docker run -d --name "$guest" --hostname "$guest" --init \
+    --cap-drop ALL --security-opt no-new-privileges:true \
+    -e TERM=xterm-256color $network $mounts \
+    aiws-base sleep infinity >/dev/null
+
+  # 5. A forwarder for the dev server's port, for guests that have a network (below).
+  [ "$egress" = none ] || aiws-port "$guest" "${AIWS_PORT:-8000}"
+}
+
+remove_guest() {
+  docker rm -f "$guest" "$guest-proxy" "$guest-port" >/dev/null 2>&1 || true
+  docker network rm "$guest" >/dev/null 2>&1 || true
+  docker volume rm "$home_volume"
+}
+
+enter_guest() {
+  [ $# -gt 0 ] || set -- zsh
+  exec docker exec -it -w /home/aiws/src "$guest" "$@"
+}
+
+case $command in
+  new)  new_guest ;;
+  rm)   remove_guest ;;
+  exec) enter_guest "$@" ;;
+  *)    usage ;;
 esac
 ```
 
-- **Repos live in the guest's home volume**, not on the host filesystem. The privileged side can't
-  accidentally run git or an editor against them; it reaches them only through the `ext::` remote
-  (§11).
+The guest's home, as the guest sees it:
+
+```
+/home/aiws/                     the home volume: persists across container recreation
+├── src/                        repos, cloned from inside
+├── .dotfiles/                  bind mount, read-only  ◀─ ~/.config/aiws/dotfiles on the host
+├── .config/nvim → .dotfiles/nvim   links made once, inside
+└── exchange/                   bind mount, writable   ◀─ ~/aiws-exchange/<guest> on the host
+```
+
+- **Repos live in the guest's home volume**, not on the host filesystem. The volume survives the
+  container, so the guest can be recreated from a new image without losing anything; it lives
+  inside the runtime's VM, so it is fast where bind mounts from macOS are slow; and the privileged
+  side can't accidentally run git or an editor against the repos, since it reaches them only
+  through the `ext::` remote (§11).
 - **Dotfiles are mounted read-only**: nvim config, shell config, git config (no credentials), the
-  global gitignore, Claude Code's global instructions. Change them once on the host and every guest
+  global gitignore, the agent's global instructions. Change them once on the host and every guest
   sees it. Inside the guest, link them into place once (`ln -s ~/.dotfiles/nvim ~/.config/nvim`).
   They must never contain secrets. `hostile-*` guests get no dotfiles: less to configure, and
   nothing of the human's in them.
@@ -164,9 +211,9 @@ item 5). The mechanism for every guest with a network: **the network denies, the
 
 - The guest is on an `--internal` Docker network, which has no route out. Non-HTTP TCP, UDP and
   external DNS simply have nowhere to go; the internal network blocks them, not the proxy. The
-  guest resolves only local names; the proxy resolves the rest. **(verify)** that Docker's embedded
-  DNS does not resolve external names for an internal network: if it did, DNS queries would be a
-  way to carry data out.
+  guest resolves only local names; the proxy resolves the rest. Checked on Docker Desktop 29.8:
+  the embedded DNS answers SERVFAIL for external names on an internal network, so DNS queries
+  can't carry data out either.
 - A proxy sidecar is on that network *and* a normal one, and is the guest's only way out. The
   guest's proxy variables point at it. Honouring them is voluntary, but a process that ignores them
   has no route at all.
@@ -223,9 +270,10 @@ pypi.org
 
 Notes:
 
-- **(verify)** on Docker Desktop: that a container on an `--internal` network cannot reach
-  `host.docker.internal`, that the proxy and the forwarder are reachable from it, and that the
-  forwarder's published port reaches the guest.
+- Checked on Docker Desktop 29.8: a container on an `--internal` network cannot reach
+  `host.docker.internal` (the name doesn't resolve there) or the internet; it resolves and reaches
+  a sidecar that is on its network and the bridge; and a port published on that sidecar reaches
+  the guest from the host.
 - Squid is the boring choice. iron-proxy is the alternative when credential injection is wanted
   (the guest holds a placeholder token, the proxy swaps in the real one at egress, so git's native
   token, SPEC.md §5, never enters the guest), at the cost of terminating TLS: every client in the
@@ -256,20 +304,23 @@ USER aiws
 WORKDIR /home/aiws
 ```
 
-- **Install image-managed tools system-wide**, never into `/home/aiws`. The home is a volume:
-  Docker copies the image's home into it only when the volume is first created, so later image
-  updates to anything under the home would never reach the guest.
-- **Per-user and self-updating tools live in the home volume** and are installed from inside the
-  guest: Claude Code (it self-updates), mise-managed toolchains (Python, Node, Java, Go), nvim
-  plugins and LSP servers. Baking toolchains into per-project images (`FROM aiws-base`)
-  is the more reproducible option once they settle.
+- **What goes in the image and what goes in the home** follows from one fact: Docker copies the
+  image's `/home/aiws` into the volume only once, when the volume is created, so anything the
+  image installs under the home never updates afterwards. Tools that install under `/usr/local`
+  (nvim, mise, priviledge, system packages) therefore live in the image, rebuilt from the
+  privileged side. Tools that install into the home (nvim's plugin manager and mason, mise's
+  toolchains, the agent and its self-updater) are installed from inside the guest. LSP servers can
+  go either way: system-wide in the image, more reproducible at the cost of a rebuild per change,
+  or through mason in the home. Baking a project's toolchain into a per-project image
+  (`FROM aiws-base`) is the reproducible option once it settles.
 - No sudo in the guest; `cap_drop` and `no-new-privileges` would defeat it anyway. Installing
   system packages means rebuilding the image from the privileged side.
-- The guest's copy of priviledge is only the client and relay, and must be on the default `PATH`
-  (`guest_exec` runs it without a login shell). Its integrity doesn't matter; it only has
-  to speak a protocol version the broker accepts (DESIGN.md §4).
-- The broker's copy is what matters (SPEC.md §3): install it on the host from a privileged-owned
-  clean clone at a reviewed tag, never from a guest.
+- priviledge is one program (DESIGN.md §1), installed the same way everywhere; in the guest only
+  its client and relay subcommands are used. It must be on the default `PATH`, since `guest_exec`
+  runs it without a login shell. Its integrity in the guest doesn't matter (SPEC.md §3): it only
+  has to speak a protocol version the broker accepts (DESIGN.md §4). The broker's copy is what
+  matters: install it on the host from a privileged-owned clean clone at a reviewed tag, never
+  from a guest.
 
 ## 7. Terminal and tmux (privileged side)
 
@@ -296,12 +347,21 @@ A per-guest window:
 ```sh
 #!/bin/sh
 # ~/bin/aiws-window: aiws-window <profile> <name>
-p=$1; n=$2
-tmux new-window -n "$p/$n" "aiws $p $n nvim"
-tmux split-window -h "aiws $p $n claude"
-tmux split-window -v "aiws $p $n"
-tmux split-window -v "priviledge serve $p $n"       # approvals for this guest
+p=$1; n=$2; sock="$HOME/.local/state/aiws/$p-$n.serve"
+mkdir -p "${sock%/*}"
+tmux new-window -n "$p/$n" "aiws exec $p $n nvim"
+tmux split-window -h "aiws exec $p $n opencode"
+tmux split-window -v "aiws exec $p $n"
+tmux split-window -v "dtach -A $sock -r winch priviledge serve $p $n"   # approvals for this guest
 ```
+
+- **The approval pane in more than one window.** tmux can't show one pane in two windows, so the
+  broker runs under `dtach`, which multiplexes its terminal: a second window attaches to the same
+  socket (`dtach -a <sock> -r winch`), input from any attached window reaches the prompt, and
+  output goes to all. The socket is privileged-owned and never visible to guests. One limit
+  **(verify)**: the broker's terminal has one size, that of the window attached last, so the
+  full-screen pager or editor renders correctly only in windows of that size; the line-oriented
+  prompt is unaffected. `abduco` is the alternative with the same shape.
 
 - `docker exec -it` allocates a terminal inside the guest. The privileged pane only relays bytes,
   so no terminal device is shared with the guest. What remains is escape sequences in guest
@@ -388,23 +448,20 @@ PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
 - nvim, its plugins and every LSP server run in the guest: basedpyright/pyright,
   typescript-language-server, lua_ls, and so on. The plugin manager and mason.nvim install into the
   home volume.
-- VS Code, optionally, with Dev Containers' "Attach to Running Container", which runs the VS Code
-  server and its extensions inside the guest.
-- Claude Code runs in the guest, logged in there, with its state in the home volume. That login is
+- The agent runs in the guest, logged in there, with its state in the home volume. That login is
   a credential in the guest (SPEC.md §3, known issue); for `public` and `hostile-*` guests, prefer
-  an API key from a separate account or workspace with a spending limit. Its global
-  `CLAUDE.md` is linked from the read-only dotfiles, so the source stays intact on the host. The
-  agent could still replace the link in its own home; instructions are not a security control
-  (SPEC.md §3). Its permission allow-list includes `Bash(priviledge list)`,
-  `Bash(priviledge describe:*)`, `Bash(priviledge request:*)`, `Bash(priviledge wait:*)`,
-  `Bash(priviledge retrieve:*)`, `Bash(priviledge pending)` and `Bash(priviledge cancel:*)`.
+  an API key from a separate account with a spending limit. Its global instructions file is linked
+  from the read-only dotfiles, so the source stays intact on the host; the agent could still replace
+  the link in its own home, and instructions are not a security control (SPEC.md §3). Its permission
+  settings should let the `priviledge` commands (SPEC.md §6) run without asking: they are how the
+  agent asks, and the human answers in the approval pane, not in the agent's.
 - Browser automation (Playwright and similar) runs inside the guest as well. Chromium's own
   sandbox may not start with all capabilities dropped; Playwright then needs Chromium's
   `--no-sandbox`, leaving the guest as the boundary **(verify)**.
 - The git read-only token (SPEC.md §5) is the only native token, in a `trusted` guest's git
   credential store. Other read-only access (code host, error tracker, issue tracker) goes through
   priviledge resources.
-- Per-path tool state (Claude Code's per-project memory, `mise trust`, `direnv allow`) initialises
+- Per-path tool state (the agent's per-project memory, `mise trust`, `direnv allow`) initialises
   fresh in the guest. Existing checkouts are not migrated; clone fresh.
 
 ## 11. Git: clone, review, push, deploy
@@ -441,7 +498,8 @@ git config transfer.fsckObjects true
    afterwards only proves which commit it was, not what was displayed.
 2. *Authoritative pass* in the clean clone over the fetched objects, in a git tool that does not
    run project code: Sublime Merge (syntax-highlighted; a small parsing risk, like any
-   highlighter), or `git` + `delta` + `less`. It is quick because the change is already
+   highlighter), `git` + `delta` + `less`, or `git log -p` piped into the review nvim of §8. It is
+   quick because the change is already
    understood: it checks that the change is what was reviewed and catches anything new.
 
 **Push and deploy:**
@@ -476,7 +534,7 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
   ```
 
   `docker compose -f docker-compose.yml -f ~/.config/aiws/overrides/shop-app.yml up -d`
-  (`!override` and `!reset` need a recent Compose **(verify)**). Create the guest first: it
+  (`!override` and `!reset` need Compose 2.24 or later **(verify)**). Create the guest first: it
   creates the network.
 - **Why only the guest's network.** The guest can take over what it reaches: with the dev
   database's superuser, which dev setups usually hand out, `COPY ... TO PROGRAM` runs a program
@@ -493,18 +551,24 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
 - **Dev servers run in the guest.** Services that call back into the dev server (a reverse proxy
   container, for example) must be attached to the guest's network in the override too, and point
   at the guest by name instead of `host.docker.internal`. The human opens them in the browser
-  through the guest's forwarded port (§4), preferably in a separate browser profile from the one
-  holding real sessions.
+  through the guest's forwarded port (§4).
+- **The browser is the one host program that runs guest-authored code**: the dev server's pages
+  and scripts. It is accepted because rendering hostile pages in a sandbox is what a browser is
+  for, and a dev server is at worst a malicious website. What the sandbox doesn't cover is handled
+  around it: a separate browser profile with no extensions keeps real sessions and look-alike pages
+  apart; the browser stays updated; and local services must not trust loopback callers (§13),
+  since a page can send requests to any local port even though it can't read the answers.
 - Dev databases that matter get snapshots or credentials: the guest can reach them.
 
 ## 13. Host exposure and hygiene
 
-- **Host loopback.** On Docker Desktop, containers on a normal network can reach services listening
-  on the host's loopback through `host.docker.internal` **(verify)**. Guests in this setup are never
-  on a normal network, nor are their dev services (§12), and their proxies refuse private addresses
-  (§5), but the proxies and forwarders are. Anything the privileged side runs on localhost, and
-  every published port, is reachable from those. Audit with `lsof -nP -iTCP -sTCP:LISTEN` and make
-  sure nothing sensitive listens without authentication. priviledge itself listens on nothing.
+- **Host loopback.** On Docker Desktop, containers on a normal network reach services listening on
+  the host's loopback through `host.docker.internal` (checked on 29.8). Guests in this setup are
+  never on a normal network, nor are their dev services (§12), and their proxies refuse private
+  addresses (§5), but the proxies and forwarders are. Anything the privileged side runs on
+  localhost, and every published port, is reachable from those, and from pages the browser renders
+  from a guest (§12). Audit with `lsof -nP -iTCP -sTCP:LISTEN` and make sure nothing sensitive
+  listens without authentication. priviledge itself listens on nothing.
 - **No secrets in guests.** Nothing from the privileged home is mounted except the read-only
   dotfiles and the exchange directory.
 - **Tracked secrets in repos** reach the guest with the clone. They are a team issue: rotate and
