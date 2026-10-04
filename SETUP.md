@@ -157,6 +157,10 @@ case $command in
 esac
 ```
 
+priviledge accepts `-` in guest names (DESIGN.md §2); this helper doesn't, because it names a
+guest's network, volume and sidecars by appending to the container's name: a guest named
+`shop-proxy` would collide with the proxy of a guest named `shop`.
+
 The guest's home, as the guest sees it:
 
 ```
@@ -206,7 +210,7 @@ docker network connect "$g" "$g-port"
 
 ## 5. Egress
 
-Egress is part of a profile's C property (SPEC.md §3) and the deployment enforces it (SPEC.md §4,
+Egress is a profile's property C (SPEC.md §3) and the deployment enforces it (SPEC.md §4,
 item 5). The mechanism for every guest with a network: **the network denies, the proxy allows.**
 
 - The guest is on an `--internal` Docker network, which has no route out. Non-HTTP TCP, UDP and
@@ -396,7 +400,7 @@ choice matters:
   colouring (vim syntax or treesitter), `set nomodeline`, no plugins that execute anything, no LSP,
   and `set noswapfile noundofile shada=` so that no copy of the reviewed content (unredacted
   output, say) outlives the review.
-- Human resources (SPEC.md §8) open the same editor on an empty file for the answer.
+- Answering a human resource (SPEC.md §8) is an edit of its output in the same editor.
 - Diff review before a push (§11) is the human's own tooling, outside priviledge, under the same
   rule: no tool that runs project code.
 

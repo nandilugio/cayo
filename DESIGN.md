@@ -229,9 +229,8 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
   same name shares the file, so each `serve` start writes a start record with a **run id** (a
   random six-character base32 token; the record also carries the start time) and every entry
   carries it. The run id is also the first part of every request id (§5).
-- Spooled results (§5), review temp files (SPEC.md §7) and human-resource answer files
-  (SPEC.md §8) live in a privileged-owned temp directory with mode 0700, removed with the request
-  or when the broker exits.
+- Spooled results (§5) and review temp files (SPEC.md §7) live in a privileged-owned temp
+  directory with mode 0700, removed with the request or when the broker exits.
 
 ## 9. Technology
 
@@ -239,10 +238,10 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
   the stock system Python and no version matrix to support. A self-contained executable that needs
   nothing installed (pex's scie output or PyInstaller embed the interpreter) is a packaging option
   to evaluate when priviledge is distributed.
-- Standard library only at runtime: `socket`, `selectors`, `subprocess`, `json`, `csv`, `base64`,
+- Standard library only at runtime: `socket`, `selectors`, `subprocess`, `json`, `base64`,
   `argparse`, `tomllib`, `hashlib`, `shlex`, `tempfile`, `pwd`, `secrets`. No third-party runtime
-  dependencies. Formatting in the inline prompt is stdlib-only (SPEC.md §7's review-surface rule);
-  anything richer is the external pager or editor.
+  dependencies. The inline prompt shows content escaped, not reformatted (SPEC.md §7); anything
+  richer is the external pager or editor.
 - **Rust is a deliberate later option, not now.** priviledge's untrusted input is JSON over the
   channel, mostly passed through to subprocesses; the security-critical logic is process and
   permission handling, not parsing. The stdlib `json` scanner (and `base64`'s) is C, the one
@@ -276,7 +275,7 @@ ships (SPEC.md §10).
    external pager and editor, the audit log, a read-only cloud resource.
 4. **Git and deploy flow** (SETUP.md): clean clones, the `ext::` remote, push and deploy from a
    reviewed commit.
-5. **Human resources**, then the rest of the backlog in the order decided at the time.
+5. The rest of the backlog, in the order decided at the time.
 
 ## 12. Open questions
 

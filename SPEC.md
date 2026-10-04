@@ -34,7 +34,8 @@ Goals:
   request easier to spot, or blocks it outright, serves this goal before convenience does.
 - Low-friction approvals: most requests are reads, arrive in bursts, and should cost one key.
 - Output review before results reach the agent.
-- Small, POSIX-style, composable; macOS and Linux; minimal and stable dependencies.
+- Small, POSIX-style, composable; macOS and Linux; minimal and stable dependencies (principles
+  below).
 - Independent of how the AI workspace is hosted (container, VM, separate OS user).
 - Single user, forever.
 
@@ -48,6 +49,21 @@ Non-goals:
 - Network egress control. It is part of a guest's risk profile (§3) and the deployment provides
   it (§4); priviledge may later act as its approval backend (§10).
 - A team or multi-user product.
+
+Principles, which every feature is weighed against:
+
+- **One job.** priviledge mediates privileged requests: approval, execution with credentials the
+  agent never sees, output review, audit. Any other need is met by a separate tool that composes
+  with it (the guest runtime, the egress proxy, the human's pager and editor, resource
+  executables), not by growing priviledge. A feature belongs inside only when it can't be done
+  well from outside.
+- **POSIX-style.** Processes, argv, stdin, stdout, stderr, exit statuses and files; text
+  interfaces that compose with pipes.
+- **Few, stable dependencies.** The standard library first. Any other dependency must be small,
+  mature and likely to stay maintained, and is weighed against its upgrade and attack-surface
+  cost.
+- **Less code, less to trust.** The broker is the boundary's code; every feature in it is
+  surface to review.
 
 ## 3. Threat model
 
@@ -121,49 +137,62 @@ traffic, or acting as it. Consequences:
 Prompt injection is unsolved: an agent that reads text an attacker controls may follow
 instructions in it, and no filter reliably prevents that. The more capable the agent, the more it
 can do with one injected instruction. So the design assumes the agent *will* eventually act on
-hostile input, and limits what that can reach. The framing is Meta's *Agents Rule of Two*, which
-matches Willison's *lethal trifecta*: an agent has three risk properties, and holding all three at
-once is unsafe unless a human supervises.
+hostile input, and limits what that can reach.
 
-- **A. Can process untrustworthy inputs**: text or code an attacker may have written. Public
-  issue trackers, pull requests, arbitrary web pages, dependency sources, hostile samples.
-- **B. Can have access to sensitive systems or private data**: credentials in the guest,
-  priviledge resources it may request, private source.
-- **C. Can change state or communicate externally.** Meta defines C as one property. This
-  document tags its two halves, because a deployment controls them with different means:
-  - **C-state**: writes to anything outside the guest: pushes, PR comments, ticket edits, prod
-    writes.
-  - **C-egress**: sending data out of the guest at all. With unrestricted egress, any leak needs
-    nothing but `curl`.
+The framing is Meta's *Agents Rule of Two*, itself inspired by Willison's *lethal trifecta*. Meta
+names three properties: [A] processing untrustworthy inputs, [B] access to sensitive systems or
+private data, [C] changing state or communicating externally; an agent may hold at most two
+without a human supervising. This document uses them with two refinements from the discussion
+that followed: Meta's authors clarified that B covers access to *any* sensitive system, so a
+state change that matters already needs B; and Willison pointed out that untrusted input with the
+ability to change state is harmful on its own. So write access belongs with B, C keeps only the
+communication half, and the rule splits by the harm it prevents.
 
-B and C meet at a credential: holding a write credential is B (access); using it is C-state.
+- **A. Untrustworthy input**: text or code an attacker may have written. Public issue trackers,
+  pull requests, arbitrary web pages, dependency sources, hostile samples.
+- **B. Sensitive reach**, through a credential in the guest or a priviledge resource it may
+  request, in two halves:
+  - **B-read**: reading private data or sensitive systems, private source included.
+  - **B-write**: changing their state: pushes, PR comments, ticket edits, prod writes.
+- **C. Egress**: sending data out of the guest at all. With unrestricted egress, any leak needs
+  nothing but `curl`.
 
-**Rule:** a guest may hold at most two of A, B and C outright. When a task needs all three, the
-third goes through a human step (priviledge approval for C-state, a human-carried transfer for
-egress) or is removed. The guest's **profile** is the concrete choice of B and C for a given
-kind of A. Profiles are named in the configuration (§8); a deployment implements each one as a
-guest shape (image, mounted credentials, egress policy). The reference set:
+Rules:
 
-| Profile | A: input | B: sensitive reach | C-state | C-egress |
+- **Integrity: A with B-write needs a human.** An injected agent with write access does damage
+  without leaking anything. So every write is approved by the human: a resource with a write
+  credential is never auto-approved (§8), and the guest holds no write credential to a sensitive
+  system.
+- **Confidentiality: A, B-read and C together need a human.** That is the lethal trifecta:
+  injected instructions read private data and send it out. One leg is broken: outputs are
+  reviewed before they reach the guest (`confirm_output`), egress goes, or the read access does.
+
+The guest's **profile** is the concrete choice of B and C for a given kind of A. Profiles are
+named in the configuration (§8); a deployment implements each one as a guest shape (image,
+mounted credentials, egress policy). The reference set:
+
+| Profile | A: input | B-read | B-write | C: egress |
 |---|---|---|---|---|
-| `trusted` | The human's own projects and vetted sources | Read-only resources may auto-approve; write resources ask | Through priviledge, asked | Allow-list |
-| `public` | Open-source work: public issues, PRs, general web | No credentials in the guest; every request asks | Through priviledge, asked | Allow-list |
-| `hostile-web` | Content that may target automated readers | **Nothing**: no credentials, no resources | None | Broad to the internet, needed by the task; no host or local network |
-| `hostile-sample` | Samples, exploits, CTF material | Nothing | None | **None** |
+| `trusted` | The human's own projects and vetted sources | Resources; read-only ones may auto-approve and release unreviewed | Through priviledge, asked | Allow-list |
+| `public` | Open-source work: public issues, PRs, general web | Resources only, no credentials in the guest; every request and output asked | Through priviledge, asked | Allow-list |
+| `hostile-web` | Content that may target automated readers | **Nothing**: no credentials, no resources | Nothing | Broad to the internet, needed by the task; no host or local network |
+| `hostile-sample` | Samples, exploits, CTF material | Nothing | Nothing | **None** |
 
-Two consequences worth stating:
+Three consequences worth stating:
 
-- **Open-source work is not the safe middle.** Reading strangers' text (A), holding credentials
-  to one's own repos (B) and pushing or commenting (C) is the full set in one session by default;
-  `public` breaks it by keeping every write behind approval and no write credential in the guest.
-- **In `trusted`, the allow-list limits A as well as C-egress.** What the agent reads from the
-  network (package pages, raw files on a code host) is strangers' text too, and any allowed host
-  that accepts uploads from any account is a way out. Unattended prod reads (`confirm_output =
-  false`) are only as safe as that list: keep hosts that store data off it, or review the output.
+- **Open-source work is not the safe middle.** Reading strangers' text (A) while holding write
+  credentials to one's own repos is the integrity case outright, and with egress any private
+  source in reach is the confidentiality case too. `public` keeps every write behind approval,
+  no credential in the guest, and every output reviewed.
+- **In `trusted`, the allow-list limits A as well as C.** What the agent reads from the network
+  (package pages, raw files on a code host) is strangers' text too, and any allowed host that
+  accepts uploads from any account is a way out. Unattended prod reads (`confirm_output = false`)
+  are only as safe as that list: keep hosts that store data off it, or review the output.
 - **Hostile content is handled by removing B, not by trusting filters.** For `hostile-web` the
   task needs broad egress, so the guest holds nothing worth taking; the host and the local network
   stay out of reach, since services there are something worth taking too. For samples, egress
-  goes too.
+  goes too. What A with C can still do is harm others (abuse sent from the guest), which, as in
+  Meta's rule, is out of priviledge's scope.
 
 The same project may need guests of different profiles: developing it in `trusted`, triaging its
 public tracker in `public`.
@@ -194,7 +223,7 @@ public tracker in `public`.
 - **Known issue: the agent's own credential.** Every guest that runs an agent holds the agent's
   login or API key, including profiles that otherwise hold nothing. Use a dedicated key with a
   spending limit for untrusted profiles.
-- An egress allow-list narrows C-egress but doesn't close it. Any allowed host that stores data for
+- An egress allow-list narrows C but doesn't close it. Any allowed host that stores data for
   whoever authenticates (a model provider's API with an attacker's key, a package registry, a code
   host) can carry data out. That is why `public` reviews every output rather than relying on its
   allow-list.
@@ -252,8 +281,8 @@ with auto-approval still exposes the *data* it returns to the guest, so conditio
 it as well. Native grants remain for tools that cannot go through the client, such as git's
 credential for `fetch` and `pull`.
 
-Classifying requests by content ("this SQL is a read") is never the security boundary; it may only
-drive auto-approval on resources whose credential is already limited.
+Auto-approval is a per-resource setting of each profile, never a judgement of the request's
+content ("this SQL is a read"). To auto-approve less, narrow the credential.
 
 Initial placement (to be confirmed per service):
 
@@ -392,8 +421,9 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact
 - **All agent-supplied text is rendered with control characters escaped.** Requests and outputs
   must not be able to move the cursor, hide lines, restyle the prompt, or send queries to the
   terminal.
-- The inline prompt shows escaped plain text with simple formatting (JSON pretty-printed, CSV
-  aligned). The prompt shows size and a head/tail preview. Output is limited only by a
+- The inline prompt shows the content as it is, escaped, never reformatted: a view rebuilt from
+  parsed content can differ from what is approved (a JSON object with a duplicate key shows only
+  one of them). The prompt shows size and a head/tail preview. Output is limited only by a
   per-request cap (a resource that exceeds it fails, telling the agent to narrow the request);
   request payloads are capped too (§3).
 - `view` opens the content in `$PRIVILEDGE_REVIEW_PAGER`, from a privileged-owned temp file whose
@@ -416,9 +446,9 @@ Comfortable review and small attack surface pull in opposite directions, and the
 settles it:
 
 > priviledge itself renders untrusted content only as escaped plain text, with the standard
-> library and no parser beyond JSON and CSV. Any richer view (syntax colour, diffing, folding) is
-> delegated to an external tool the human chooses, which works on a privileged-owned *copy* of the
-> content and must never execute anything from it. priviledge's own surface stays small and
+> library and no parser. Any richer view (syntax colour, diffing, folding) is delegated to an
+> external tool the human chooses, which works on a privileged-owned *copy* of the content and
+> must never execute anything from it. priviledge's own surface stays small and
 > auditable; the richer tool's surface is the human's explicit choice.
 
 For those external tools: no LSP, ever (LSP servers execute project code); syntax highlighting is
@@ -462,12 +492,10 @@ run = "~/.config/priviledge/resources/aws-readonly"
 args = true
 output_syntax = "json"
 
-[resources.dashboard-query]
-kind = "human"
-description = "A query for the human to run in the monitoring dashboard. Payload: the query."
+[resources.ask-human]
+description = "A task for the human: a dashboard query, a value off a console, a question. Payload: the task."
+run = "~/.config/priviledge/resources/ask-human"   # echoes the task back (§8, human resources)
 input = "stdin"
-input_syntax = "json"
-output_syntax = "json"
 
 [profiles.trusted]
 guest_exec = ["docker", "exec", "-i", "aiws-{profile}-{name}"]
@@ -476,7 +504,7 @@ notify = "bell"
 prod-db-ro = { confirm_request = false, confirm_output = false }
 prod-db-rw = {}
 aws-readonly = { confirm_request = false }
-dashboard-query = {}
+ask-human = {}
 
 [profiles.public]
 guest_exec = ["docker", "exec", "-i", "aiws-{profile}-{name}"]
@@ -517,11 +545,10 @@ is why the confirmation settings live here.
 
 | Field | Meaning |
 |---|---|
-| `kind` | `"exec"` (default) or `"human"` |
 | `description` | Shown to the agent by `list`/`describe` and to the human in the prompt |
-| `run` | The privileged-owned executable (`exec` only) |
+| `run` | The privileged-owned executable |
 | `input` | `"stdin"` if the resource takes a payload. Omitted: no payload accepted |
-| `args` | `true` if extra arguments after `--` are passed as argv (`exec` only). Default `false` |
+| `args` | `true` if extra arguments after `--` are passed as argv. Default `false` |
 | `params` | Table of named parameters and their descriptions. Undeclared parameters are rejected |
 | `input_syntax`, `output_syntax` | Review hints: the file extension used for `view`/`edit` |
 | `write_credential` | `true` if the resource's credential can change state. Default `false`. The human's declaration of what the credential enforces |
@@ -543,9 +570,9 @@ A resource has one audience on each side, and the broker keeps them apart:
 Resource executables are therefore wrappers written for this contract, not stock tools exposed
 directly. They may be shared, and priviledge may ship some, but each one is the human's choice.
 
-### Exec resources
+### Resource executables
 
-An `exec` resource is an executable owned by the privileged user. It is executed directly (never
+A resource is an executable owned by the privileged user. It is executed directly (never
 through `sh -c`). It receives the payload on stdin, declared parameters as `PRIVILEDGE_P_<NAME>`
 environment variables, and, if `args = true`, the extra arguments as argv. The agent cannot set
 any other part of its environment. It fetches its own secrets with whatever the OS provides (macOS
@@ -611,16 +638,16 @@ Narrow the credential, or the subcommands the executable allows, before auto-app
 
 ### Human resources
 
-A `human` resource is a task only the human can do, fast, without ending the agent's turn:
+Some tasks only the human can do, and the agent needs them done without ending its turn:
 running a query in a browser console, reading a value off a dashboard, answering a question.
 The agent's alternative is to stop and ask, which tends to make it summarise, draw conclusions
 and act as if the turn were over, when the missing information may change those conclusions.
 
-The request is shown like any other, with the payload as the task. On `y` the broker opens
-`$PRIVILEDGE_REVIEW_EDITOR` on an empty privileged-owned temp file; what the human saves is the
-result (stdout, in the contract above). `n` denies. `confirm_output` applies as for any resource
-and defaults to `true`, although the human wrote the output; setting it to `false` skips the second
-look.
+No special kind of resource is needed: an executable that echoes its payload back (`exec cat`),
+with `confirm_output` left `true`. The human approves the request, the task comes back as the
+output, and at the release prompt the human edits it into the answer (`e`) and releases it. The
+agent gets the answer with §6's notice that the human changed the output; `n` denies, with a
+message, as for any request.
 
 ### Session resources (backlog)
 
@@ -629,7 +656,7 @@ shell, a remote ssh shell. Essential in practice (slow start-up, loaded state,
 interactive auth at start). Each approved snippet runs in the same live session and returns its
 output. The same three properties apply: a local psql session would have to be
 confined, while a remote console runs its input remotely. Until session resources exist, the same
-work is done with repeated exec requests (each query is one request), which is slower but simple
+work is done with repeated requests (each query is one request), which is slower but simple
 and safe.
 
 ## 9. Audit log
@@ -648,16 +675,18 @@ Development is iterative: after each item ships, the next one is chosen. The ord
 current intent, not a plan. Releases use semantic versioning, `0.x` while the interfaces in this
 document may still change, `1.0` when they stop.
 
-1. **The core**: exec resources, profiles, the client (`list`, `describe`, `request`, `wait`,
+1. **The core**: resources, profiles, the client (`list`, `describe`, `request`, `wait`,
    `retrieve`, `pending`, `cancel`), the sequential approval prompt with both confirmations and
    output review, the audit log.
-2. **Human resources** (§8).
-3. **Checkers**: privileged-owned executables that receive a request before the prompt and return
+2. **Checkers**: privileged-owned executables that receive a request before the prompt and return
    *pass*, *flag* (with a note the prompt shows) or *block*. Pattern rules first; other kinds
    possible. They follow the review-surface rule (§7) and the resource input rules (§8).
-4. **Concurrent execution**: several approved requests running at once, with their release
+3. **Concurrent execution**: several approved requests running at once, with their release
    prompts queued. Needs its own UX pass.
-5. **Session resources** (§8).
+4. **Session resources** (§8).
+5. **Review formatting**: formatters for the inline prompt that only insert whitespace and
+   colour (pattern-based, per `input_syntax`/`output_syntax`) and never rebuild the content, so
+   what is shown is still exactly what is approved (§7).
 6. **Egress approval**: the deployment's egress proxy asks priviledge before allowing a new host,
    so the human approves domains the way they approve requests.
 7. **MCP servers on the privileged side.** Some integrations exist only as MCP servers. The broker
