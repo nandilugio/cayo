@@ -135,7 +135,7 @@ on this guest's channel *is* this guest.
 - The relay runs as whichever user `guest_exec` lands on, and clients must run as that same user
   to reach its socket. With `docker exec -i` that is the image's default user; a command that
   switches user (e.g. `-u 0`) would create a socket the guest's normal user cannot use.
-- The relay listens on `<home>/.local/state/priviledge/relay.sock` (directory mode 0700), where
+- The relay listens on `<home>/.priviledge/relay.sock` (directory mode 0700), where
   `<home>` is the running user's home from the passwd database, not from the environment. The
   relay and the clients start in different environments (`guest_exec` runs no login shell; the
   agent's shell may export `XDG_STATE_HOME` or `XDG_RUNTIME_DIR`), so any path derived from
@@ -242,9 +242,9 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
 
 ## 8. Files
 
-- Config and state follow the **XDG Base Directory** spec on the privileged side:
-  `$XDG_CONFIG_HOME/priviledge` (config, SPEC.md §8), `$XDG_STATE_HOME/priviledge` (audit logs).
-- Audit log: `$XDG_STATE_HOME/priviledge/<profile>/<name>.jsonl`, one JSON line per request step,
+- Everything lives under `~/.priviledge` on the privileged side (SPEC.md §8), with no override
+  through the environment; tests set `HOME`.
+- Audit log: `~/.priviledge/log/<profile>/<name>.jsonl`, one JSON line per request step,
   each carrying the request id (SPEC.md §9). A directory per profile keeps names apart without
   restricting them: `a/b-c` and `a-b/c` would collide in a single flat name. `profile/name` is
   unique only while the guest exists

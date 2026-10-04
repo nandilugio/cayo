@@ -516,11 +516,13 @@ The same rule applies to checkers (§10): external executables, not in-process p
 
 ### Configuration file
 
-`$XDG_CONFIG_HOME/priviledge/config.toml` (privileged-owned, mode 0600), i.e.
-`~/.config/priviledge/` by default. The broker refuses to start if the config file or any
-resource's `run` executable, or any directory above either of them up to the home directory, is
-group- or world-writable or not owned by the privileged user: a writable directory would let
-someone swap the file. A leading `~` in paths is expanded.
+`~/.priviledge/config.toml` (privileged-owned, mode 0600). Everything that defines the human's
+privileged capabilities lives under `~/.priviledge` (mode 0700): the configuration, the resource
+executables by convention, and the audit logs (§9). One tree to protect, inspect and back up, as
+with `~/.ssh`. The broker refuses to start if the config file or any resource's `run`
+executable, or any directory above either of them up to the home directory, is group- or
+world-writable or not owned by the privileged user: a writable directory would let someone swap
+the file. A leading `~` in paths is expanded.
 
 The file declares **resources** (what exists) and **profiles** (who may use what, with how much
 confirmation). Guests are not in the file: a guest is an instance of a profile, created by the
@@ -529,14 +531,14 @@ deployment and named when the broker starts (`priviledge serve <profile> <name>`
 ```toml
 [resources.prod-db-ro]
 description = "Production Postgres (read-only role). Bound queries on large tables by time."
-run = "~/.config/priviledge/resources/prod-db-ro"
+run = "~/.priviledge/resources/prod-db-ro"
 input = "stdin"            # takes a payload: the SQL
 input_syntax = "sql"
 output_syntax = "csv"
 
 [resources.prod-db-rw]
 description = "Production Postgres (read-write role)."
-run = "~/.config/priviledge/resources/prod-db-rw"
+run = "~/.priviledge/resources/prod-db-rw"
 input = "stdin"
 input_syntax = "sql"
 output_syntax = "csv"
@@ -544,13 +546,13 @@ write_credential = true
 
 [resources.aws-readonly]
 description = "AWS CLI with the read-only role. Pass the aws arguments after --."
-run = "~/.config/priviledge/resources/aws-readonly"
+run = "~/.priviledge/resources/aws-readonly"
 args = true
 output_syntax = "json"
 
 [resources.ask-human]
 description = "A task for the human: a dashboard query, a value off a console, a question. Payload: the task."
-run = "~/.config/priviledge/resources/ask-human"   # echoes the task back (§8, human resources)
+run = "~/.priviledge/resources/ask-human"   # echoes the task back (§8, human resources)
 input = "stdin"
 
 [profiles.trusted]

@@ -40,6 +40,24 @@ host: privileged side                         Docker VM
 - The privileged side drives guests only through the runtime's CLI, and never runs code written in
   a guest except reviewed code at a pinned commit (§11, §12).
 
+**Files.** The scripts and configuration in this document are an example, not part of
+priviledge. Copy them to `~/.aiws` and make them yours: from then on they don't follow the
+repository, and nothing here is supported beyond being an example. priviledge's own files live in
+`~/.priviledge` (SPEC.md §8), separate because only those matter to the broker; another
+deployment has no `~/.aiws` at all. Copy from a checkout you trust; for priviledge's own
+development that means a clean clone at a reviewed commit (§11), never a guest's working copy.
+
+```
+~/.aiws/
+├── bin/          aiws, aiws-egress, aiws-port, aiws-window (on PATH)
+├── Dockerfile
+├── egress/       squid-allowlist.conf, squid-public.conf, <guest>.txt allow-lists
+├── dotfiles/     mounted read-only into trusted and public guests
+├── overrides/    compose overrides per project (§12)
+└── run/          dtach sockets of the approval panes (§7)
+~/aiws-exchange/<guest>/   exchange directories: guest-written, so kept out of ~/.aiws
+```
+
 ## 2. Container runtime
 
 Any runtime with a Docker-compatible CLI works: Docker Desktop, colima, Podman. priviledge only
@@ -47,10 +65,10 @@ needs `exec -i`.
 
 - **Licensing:** Docker Desktop's licence depends on your situation; colima and Podman are free.
 - **File sharing:** restrict the runtime's shared host paths to what containers actually mount:
-  the dotfiles and exchange directories (§4), and the clean-clone paths that project compose files
-  bind-mount (§12). Not all of `/Users`. If a guest escaped into the runtime's VM, it would reach
-  whatever the VM can see, including those clean clones. **(verify)** that Docker Desktop allows
-  removing the default paths.
+  the dotfiles, egress configuration and exchange directories (§4, §5), and the clean-clone paths
+  that project compose files bind-mount (§12). Not all of `/Users`. If a guest escaped into the
+  runtime's VM, it would reach whatever the VM can see, including those clean clones.
+  **(verify)** that Docker Desktop allows removing the default paths.
 - **Never** give a guest the runtime's control socket (`/var/run/docker.sock` or equivalent),
   `privileged: true`, host networking, or the host PID namespace. Any of these hands the guest the
   privileged side.
@@ -80,7 +98,7 @@ inside it.
 
 ```sh
 #!/bin/sh
-# ~/bin/aiws: create, remove and enter guests.
+# ~/.aiws/bin/aiws: create, remove and enter guests.
 #   aiws new  <profile> <name>            create the guest aiws-<profile>-<name>
 #   aiws rm   <profile> <name>            remove it, with its network, sidecars and home volume
 #   aiws exec <profile> <name> [cmd...]   run a command in it (default: a shell)
@@ -99,7 +117,7 @@ esac
 guest="aiws-$profile-$name"        # the container; also the prefix of its network and sidecars
 home_volume="$guest-home"
 exchange_dir="$HOME/aiws-exchange/$guest"
-dotfiles_dir="$HOME/.config/aiws/dotfiles"
+dotfiles_dir="$HOME/.aiws/dotfiles"
 
 new_guest() {
   # 1. What the profile decides: the mounts, and the egress mode (§5).
@@ -166,7 +184,7 @@ The guest's home, as the guest sees it:
 ```
 /home/aiws/                     the home volume: persists across container recreation
 ├── src/                        repos, cloned from inside
-├── .dotfiles/                  bind mount, read-only  ◀─ ~/.config/aiws/dotfiles on the host
+├── .dotfiles/                  bind mount, read-only  ◀─ ~/.aiws/dotfiles on the host
 ├── .config/nvim → .dotfiles/nvim   links made once, inside
 └── exchange/                   bind mount, writable   ◀─ ~/aiws-exchange/<guest> on the host
 ```
@@ -200,7 +218,7 @@ The guest's home, as the guest sees it:
 
 ```sh
 #!/bin/sh
-# ~/bin/aiws-port: aiws-port <guest> <host-port>, forwarded to port 8000 in the guest.
+# ~/.aiws/bin/aiws-port: aiws-port <guest> <host-port>, forwarded to port 8000 in the guest.
 # Created on the bridge so its port can be published, then attached to the guest's network.
 g=$1; port=$2
 docker run -d --name "$g-port" --network bridge -p "127.0.0.1:$port:8000" \
@@ -230,21 +248,21 @@ item 5). The mechanism for every guest with a network: **the network denies, the
 
 ```sh
 #!/bin/sh
-# ~/bin/aiws-egress: aiws-egress <guest> allowlist|public
+# ~/.aiws/bin/aiws-egress: aiws-egress <guest> allowlist|public
 g=$1; mode=$2; list=
 if [ "$mode" = allowlist ]; then
-  f=$HOME/.config/aiws/egress/$g.txt           # must exist: Docker would create a directory
+  f=$HOME/.aiws/egress/$g.txt                  # must exist: Docker would create a directory
   [ -f "$f" ] || { echo "missing allow-list $f" >&2; exit 1; }
   list="-v $f:/etc/squid/allow.txt:ro"
 fi
 docker run -d --name "$g-proxy" --network bridge $list \
-  -v "$HOME/.config/aiws/egress/squid-$mode.conf:/etc/squid/squid.conf:ro" \
+  -v "$HOME/.aiws/egress/squid-$mode.conf:/etc/squid/squid.conf:ro" \
   ubuntu/squid >/dev/null
 docker network connect --alias "$g-proxy" "$g" "$g-proxy"
 ```
 
 ```
-# ~/.config/aiws/egress/squid-allowlist.conf (the relevant part)
+# ~/.aiws/egress/squid-allowlist.conf (the relevant part)
 acl private dst 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 127.0.0.0/8
 acl private dst 169.254.0.0/16 ::1 fc00::/7 fe80::/10
 acl allowed dstdomain "/etc/squid/allow.txt"
@@ -256,14 +274,14 @@ http_access allow allowed
 http_access deny all
 http_port 3128
 
-# ~/.config/aiws/egress/squid-public.conf: the same, without `allowed`, ending in
+# ~/.aiws/egress/squid-public.conf: the same, without `allowed`, ending in
 http_access deny private
 http_access deny CONNECT !SSL_ports
 http_access allow all
 ```
 
 ```
-# ~/.config/aiws/egress/aiws-trusted-shop.txt
+# ~/.aiws/egress/aiws-trusted-shop.txt
 .anthropic.com
 .githubusercontent.com
 pypi.org
@@ -295,7 +313,7 @@ Notes:
 A base image with the shared tooling, running as a non-root user:
 
 ```dockerfile
-# ~/.config/aiws/Dockerfile
+# ~/.aiws/Dockerfile
 FROM debian:stable-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git less openssh-client ripgrep fd-find zsh \
@@ -350,8 +368,8 @@ A per-guest window:
 
 ```sh
 #!/bin/sh
-# ~/bin/aiws-window: aiws-window <profile> <name>
-p=$1; n=$2; sock="$HOME/.local/state/aiws/$p-$n.serve"
+# ~/.aiws/bin/aiws-window: aiws-window <profile> <name>
+p=$1; n=$2; sock="$HOME/.aiws/run/$p-$n.serve"
 mkdir -p "${sock%/*}"
 tmux new-window -n "$p/$n" "aiws exec $p $n nvim"
 tmux split-window -h "aiws exec $p $n opencode"
@@ -408,12 +426,12 @@ choice matters:
 
 Resource executables are the human's, written to the contract and the three properties in
 SPEC.md §8. The repository will carry complete, tested examples under `examples/resources/`, to
-copy into `~/.config/priviledge/resources/` and adapt; the two below are for the resources in
+copy into `~/.priviledge/resources/` and adapt; the two below are for the resources in
 SPEC.md's example configuration.
 
 ```sh
 #!/bin/sh
-# ~/.config/priviledge/resources/aws-readonly
+# ~/.priviledge/resources/aws-readonly
 # Only allow-listed operations; global options go after them. No host files, no other endpoint.
 case "$1 $2" in
   "logs filter-log-events"|"logs describe-log-groups"|"ecs describe-services") ;;
@@ -426,19 +444,19 @@ for a in "$@"; do
 done
 # Only this profile's files. The broker's fixed environment (SPEC.md §8) keeps any AWS_* the
 # human exported out of here.
-AWS_CONFIG_FILE="$HOME/.config/priviledge/aws/readonly.config" \
-AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/priviledge/aws/readonly.credentials" \
+AWS_CONFIG_FILE="$HOME/.priviledge/aws/readonly.config" \
+AWS_SHARED_CREDENTIALS_FILE="$HOME/.priviledge/aws/readonly.credentials" \
   exec aws "$@"
 ```
 
 ```sh
 #!/bin/sh
-# ~/.config/priviledge/resources/prod-db-ro
+# ~/.priviledge/resources/prod-db-ro
 # `sqlquery` is the human's driver-based script: one SQL statement in on stdin, sent with the
 # extended query protocol (which refuses a second one, so a SET can't lift the timeout), CSV
 # out, and the driver's own errors on stderr, for the human.
 PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
-  exec "$HOME/.config/priviledge/bin/sqlquery" \
+  exec "$HOME/.priviledge/bin/sqlquery" \
   "host=... user=app_ro dbname=... options='-c statement_timeout=60s'"
 ```
 
@@ -462,6 +480,9 @@ PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
 - nvim, its plugins and every LSP server run in the guest: basedpyright/pyright,
   typescript-language-server, lua_ls, and so on. The plugin manager and mason.nvim install into the
   home volume.
+- The example uses opencode, which is open source. Any agent that runs shell commands works the
+  same way, since it reaches priviledge only through the client's commands (SPEC.md §6); several
+  agents can share one guest.
 - The agent runs in the guest, logged in there, with its state in the home volume. That login is
   a credential in the guest (SPEC.md §3, known issue); for `public` and `hostile-*` guests, prefer
   an API key from a separate account with a spending limit. Its global instructions file is linked
@@ -563,7 +584,7 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
   published ports:
 
   ```yaml
-  # ~/.config/aiws/overrides/shop-app.yml
+  # ~/.aiws/overrides/shop-app.yml
   services:
     app-postgres:
       networks: !override [aiws]
@@ -574,7 +595,7 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
       external: true
   ```
 
-  `docker compose -f docker-compose.yml -f ~/.config/aiws/overrides/shop-app.yml up -d`
+  `docker compose -f docker-compose.yml -f ~/.aiws/overrides/shop-app.yml up -d`
   (`!override` and `!reset` need Compose 2.24 or later **(verify)**). Create the guest first: it
   creates the network.
 - **Why only the guest's network.** The guest can take over what it reaches: with the dev
@@ -674,7 +695,8 @@ any address fails at once).
 From the host:
 
 - A dev server started in a guest answers on `http://127.0.0.1:<AIWS_PORT>`.
-- The runtime's shared paths are only the dotfiles, exchange and clean-clone directories.
+- The runtime's shared paths are only the dotfiles, egress configuration, exchange and clean-clone
+  directories.
 - Loopback listeners reachable via `host.docker.internal` are known and acceptable.
 - The proxy's log shows only allow-listed hosts passing.
 - Dev-service containers have no route out: from the clean clone, `docker compose exec` into one
