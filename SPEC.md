@@ -358,9 +358,9 @@ priviledge wait "$a" "$b" && priviledge retrieve "$a" | jq ... && priviledge ret
   again keeps its own copy.
 - If the human edited the request, `retrieve` says so on stderr, followed by the version that ran,
   so the agent does not reason from a query it did not actually get answered. If the human
-  redacted the output, it says so on stderr, so the agent does not take withheld data for absent
-  data. stdout carries only the result. The original request and the unredacted output are never
-  sent; they exist only in the audit log.
+  changed the output (redacted it, or wrote an answer into it), it says so on stderr, so the agent
+  does not take withheld data for absent data. stdout carries only the result. The original
+  request and the original output are never sent; they exist only in the audit log.
 
 **Exit status.** Resource executables never talk to the agent through exit codes (§8), so the
 client's own codes cannot collide with theirs:
@@ -665,7 +665,7 @@ Every request is recorded on the privileged side, one log per guest (`profile/na
 broker run marked so that a guest recreated under the same name stays distinguishable. Entries
 carry: request id, reason, the request as submitted and as run (if edited), decisions,
 timestamps, exit status, the resource's stderr, output size and a hash of the output, and the
-unredacted output when the released one was redacted. Output bodies are not logged otherwise.
+original output when the released one was changed. Output bodies are not logged otherwise.
 Each step of a request (received, decided, started, finished, released, retrieved, or cancelled or
 dropped) is recorded as it happens, so a crash leaves a record of how far every request got.
 
