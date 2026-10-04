@@ -399,25 +399,34 @@ The approval prompt shows escaped plain text; any richer view comes from the pag
 human configures (SPEC.md §7). They run as the privileged user over agent-authored content, so the
 choice matters:
 
-- `$PRIVILEDGE_REVIEW_PAGER` and `$PRIVILEDGE_REVIEW_EDITOR` are argv strings, run without a shell.
-- The default pager is `less -+r -+R --no-lessopen`. Shell setups often export `LESS=-R`, which
-  would pass escape sequences to the terminal; `-+` resets those options whatever `LESS` says. Many
-  systems set `LESSOPEN` to a lesspipe script that runs other programs over the file.
+- They are the `[review]` argv lists in `~/.priviledge/config.toml`, run without a shell and with
+  a fixed environment, so an exported `LESS=-R` (escape sequences passed to the terminal) or
+  `LESSOPEN` (a lesspipe script running other programs over the file) never reaches them.
+  Tool-specific settings go in the list itself, e.g. `["env", "LESSHISTFILE=-", "less", ...]`.
+- The default pager is `less -+r -+R --no-lessopen`; the `-+` options reset raw control
+  characters whatever a lesskey file says.
 - The default editor, `vi`, is vim on many systems and loads the human's own vimrc and plugins,
-  with modelines on. Set `$PRIVILEDGE_REVIEW_EDITOR` explicitly rather than relying on it.
+  with modelines on. Set the editor explicitly rather than relying on it.
 - A minimal nvim serves as both, the pager in read-only mode:
 
-  ```
-  PRIVILEDGE_REVIEW_PAGER="env NVIM_APPNAME=priviledge-review nvim -R"
-  PRIVILEDGE_REVIEW_EDITOR="env NVIM_APPNAME=priviledge-review nvim"
+  ```toml
+  [review]
+  pager = ["nvim", "--clean", "-u", "~/.priviledge/review.lua", "-R"]
+  editor = ["nvim", "--clean", "-u", "~/.priviledge/review.lua"]
   ```
 
-  `NVIM_APPNAME` gives it its own configuration and plugin directories
-  (`~/.config/priviledge-review/`, privileged-owned). `-u <file>` alone is not enough: nvim still
-  loads plugins from the normal configuration and data directories. In that configuration: syntax
-  colouring (vim syntax or treesitter), `set nomodeline`, no plugins that execute anything, no LSP,
-  and `set noswapfile noundofile shada=` so that no copy of the reviewed content (unredacted
-  output, say) outlives the review.
+  ```lua
+  -- ~/.priviledge/review.lua
+  vim.o.modeline = false   -- the content must not set options
+  vim.o.swapfile = false   -- no copy of the reviewed content (unredacted output, say)
+  vim.o.undofile = false   --   outlives the review
+  vim.cmd("syntax on")     -- colouring from nvim's bundled syntax files
+  ```
+
+  `--clean` starts nvim without the human's configuration, plugins or shada, and `-u` then loads
+  only this file. Checked on nvim 0.12.5: the file is loaded, no script from the human's
+  configuration or data directories is, a modeline in the content is ignored, and bundled syntax
+  colouring works. No plugin, no LSP, no treesitter parser beyond the few nvim bundles.
 - Answering a human resource (SPEC.md §8) is an edit of its output in the same editor.
 - Diff review before a push (§11) is the human's own tooling, outside priviledge, under the same
   rule: no tool that runs project code.

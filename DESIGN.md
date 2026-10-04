@@ -262,7 +262,7 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
   nothing installed (pex's scie output or PyInstaller embed the interpreter) is a packaging option
   to evaluate when priviledge is distributed.
 - Standard library only at runtime: `socket`, `selectors`, `subprocess`, `json`, `base64`,
-  `argparse`, `tomllib`, `hashlib`, `shlex`, `tempfile`, `termios`, `pwd`, `secrets`. No
+  `argparse`, `tomllib`, `hashlib`, `tempfile`, `termios`, `pwd`, `secrets`. No
   third-party runtime dependencies. The inline prompt shows content escaped, not reformatted
   (SPEC.md §7); anything richer is the external pager or editor.
 - **Rust is a deliberate later option, not now.** priviledge's untrusted input is JSON over the

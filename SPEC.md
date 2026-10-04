@@ -462,12 +462,14 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact [r]unning [?]
   one of them). The prompt shows sizes, and content longer than its preview as head and tail with
   what is omitted. Output is limited only by a per-request cap (a resource that exceeds it fails,
   telling the agent to narrow the request); request payloads are capped too (§3).
-- `view` opens the content in `$PRIVILEDGE_REVIEW_PAGER`, from a privileged-owned temp file whose
+- `view` opens the content in the review pager, from a privileged-owned temp file whose
   extension comes from the resource's `input_syntax` / `output_syntax` (§8). `edit` does the same
-  with `$PRIVILEDGE_REVIEW_EDITOR`. Both are argv strings, run without a shell, with the file's
-  path appended as the last argument. The defaults are `less -+r -+R --no-lessopen` (raw control
-  characters off even if the `LESS` variable turns them on, input preprocessor disabled) and `vi`.
-  Both load the human's own settings for those tools; SETUP.md describes safe choices.
+  with the review editor. Both are argv lists in the configuration (`[review]`, §8), run without a
+  shell, with the file's path appended as the last argument, and with the same fixed environment
+  as resources (§8) plus `TERM` and `COLORTERM`: variables exported where `serve` started (`LESS`,
+  `LESSOPEN`, `VIMINIT`) can't change how they treat the content. The defaults are
+  `less -+r -+R --no-lessopen` (raw control characters off, input preprocessor disabled) and `vi`.
+  Both still load the human's own settings files for those tools; SETUP.md describes safe choices.
 - The two settings may name the same program. They are separate because viewing is the common
   case and deserves the smallest surface (a pager interprets nothing and streams any size), and
   because a viewer can't change what is being approved. An **edit is a change in content**: a
@@ -522,13 +524,19 @@ executables by convention, and the audit logs (§9). One tree to protect, inspec
 with `~/.ssh`. The broker refuses to start if the config file or any resource's `run`
 executable, or any directory above either of them up to the home directory, is group- or
 world-writable or not owned by the privileged user: a writable directory would let someone swap
-the file. A leading `~` in paths is expanded.
+the file. A leading `~/` (or a bare `~`) is replaced with the home directory, by the broker when
+it loads the file, in every path and every element of an argv list; nothing else is expanded, since
+no shell is involved.
 
 The file declares **resources** (what exists) and **profiles** (who may use what, with how much
 confirmation). Guests are not in the file: a guest is an instance of a profile, created by the
 deployment and named when the broker starts (`priviledge serve <profile> <name>`).
 
 ```toml
+[review]                   # the pager and editor for `view` and `edit` (§7)
+pager = ["less", "-+r", "-+R", "--no-lessopen"]
+editor = ["nvim", "--clean", "-u", "~/.priviledge/review.lua"]
+
 [resources.prod-db-ro]
 description = "Production Postgres (read-only role). Bound queries on large tables by time."
 run = "~/.priviledge/resources/prod-db-ro"
