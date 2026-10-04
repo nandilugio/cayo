@@ -288,7 +288,7 @@ Initial placement (to be confirmed per service):
 
 | Capability | Placement | Notes |
 |---|---|---|
-| Git upstream read | Native, read-only token | git needs it non-interactively; a credential helper calling priviledge is in the backlog |
+| Git upstream read | Native, read-only token | git needs it non-interactively. A credential helper that requests it through priviledge makes it short-lived and audited per use (SETUP.md); it still enters the guest |
 | Git push | Privileged side only | Feeds the deploy pipeline; never native, never a resource |
 | PR/CI read (code host) | Resource, read-only token, auto-approve eligible | |
 | Error tracker read | Resource, read-only token, auto-approve eligible | Errors may contain PII: condition 2 per profile |
@@ -298,7 +298,7 @@ Initial placement (to be confirmed per service):
 | Prod DB, read-only role | Resource, auto-approve eligible | Role enforces read-only; bound query cost (§8) |
 | Prod DB, read-write | Resource, always ask | |
 | Cloud CLI | Resources per credential | e.g. a read-only policy vs an admin one |
-| Consoles and shells on remote hosts | Session resources (backlog, §10), always ask | Full power once inside |
+| Consoles and shells on remote hosts | Session resources (§8), always ask | Full power once inside |
 | Browser-only surfaces | Human resource (§8) | The human performs the step and returns the result |
 
 Hosted connectors (an assistant's cloud integrations) run outside the machine and request
@@ -392,7 +392,9 @@ with a one-line `priviledge: ...` message on stderr.
   had effects (a write on a write resource). They are kept, flagged to the human as "not
   retrieved", and the agent can still `retrieve` them once the connection is back.
 - If the broker itself restarts, outstanding requests are lost: `wait` and `retrieve` answer 248
-  for their ids. The audit log (§9) records how far each one got.
+  for their ids. The audit log (§9) records how far each one got. Requests are not persisted: a
+  crash is rare, and a deliberate restart (a configuration change, an upgrade) asks the human to
+  confirm when requests are outstanding, and stops the running ones.
 
 ## 7. Approval
 
@@ -429,6 +431,11 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact [r]unning [?]
   first, since that result is what unblocks an agent; the rest follow in arrival order. `s` moves
   a prompt to the back of its kind. This order needs no knowledge of which agent sent what, and
   it can only reorder the guest's own prompts, never change what is shown or decided.
+- **A request is seen in full before it is approved.** Its payload, arguments and parameters
+  are shown whole when they fit the preview. When they don't, `y` and `Y` are refused until the
+  request has been opened with `v` or `e`: a line buried in the middle of a long request is
+  exactly what a hostile agent would hide. Outputs need no full view before release; `v` shows
+  them whole.
 - **A prompt never changes under the human.** The active prompt ends only with their input. Keys
   typed before a prompt is drawn are discarded, so each key answers a prompt that was on screen.
 - **Everything that runs is shown.** Requests that need no confirmation, results released
@@ -450,7 +457,8 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact [r]unning [?]
   terminal.
 - The inline prompt shows the content as it is, escaped, never reformatted: a view rebuilt from
   parsed content can differ from what is approved (a JSON object with a duplicate key shows only
-  one of them). The prompt shows size and a head/tail preview. Output is limited only by a
+  one of them). The prompt shows sizes, and content longer than its preview as head and tail with
+  what is omitted. Output is limited only by a
   per-request cap (a resource that exceeds it fails, telling the agent to narrow the request);
   request payloads are capped too (§3).
 - `view` opens the content in `$PRIVILEDGE_REVIEW_PAGER`, from a privileged-owned temp file whose
@@ -700,15 +708,19 @@ output, and at the release prompt the human edits it into the answer (`e`) and r
 agent gets the answer with §6's notice that the human changed the output; `n` denies, with a
 message, as for any request.
 
-### Session resources (backlog)
+### Session resources
 
-Long-lived interactive processes: psql, a Django shell reached through a cloud exec
-shell, a remote ssh shell. Essential in practice (slow start-up, loaded state,
-interactive auth at start). Each approved snippet runs in the same live session and returns its
-output. The same three properties apply: a local psql session would have to be
-confined, while a remote console runs its input remotely. Until session resources exist, the same
-work is done with repeated requests (each query is one request), which is slower but simple
-and safe.
+Long-lived interactive processes: psql, a Django shell reached through a cloud exec shell, a
+remote ssh shell. Essential in practice (slow start-up, loaded state, interactive auth at start).
+Each approved snippet runs in the same live session and returns its output.
+
+priviledge doesn't hold sessions. A separate **session holder** keeps the process alive, in its
+own terminal where the human completes any interactive authentication, and a resource executable
+sends it each approved snippet and returns the output. The resource's `concurrency = 1` keeps
+the session serial. A holder may ship with priviledge as a separate tool (§10). The same three
+properties apply: a local psql session would have to be confined, while a remote console runs its
+input remotely. Until a holder exists, the same work is done with repeated requests (each query
+is one request), which is slower but simple and safe.
 
 ## 9. Audit log
 
@@ -733,29 +745,26 @@ document may still change, `1.0` when they stop.
 2. **Checkers**: privileged-owned executables that receive a request before the prompt and return
    *pass*, *flag* (with a note the prompt shows) or *block*. Pattern rules first; other kinds
    possible. They follow the review-surface rule (§7) and the resource input rules (§8).
-3. **Session resources** (§8).
+3. **A session holder** (§8): a separate tool that keeps an interactive process alive and runs
+   the snippets a resource executable sends it, outside the broker.
 4. **Review formatting**: formatters for the inline prompt that only insert whitespace and
    colour (pattern-based, per `input_syntax`/`output_syntax`) and never rebuild the content, so
-   what is shown is still exactly what is approved (§7).
-5. **Egress approval**: the deployment's egress proxy asks priviledge before allowing a new host,
-   so the human approves domains the way they approve requests.
-6. **MCP servers on the privileged side.** Some integrations exist only as MCP servers. The broker
-   runs them, with their credentials, and the client exposes them to the guest through a stdio
-   adapter that forwards only `tools/list` and `tools/call`; each call is a request with the
-   profile's confirmation settings, per tool. The server processes agent input with a credential,
-   so it runs confined, like any resource that does.
-7. **HTTP resources**: `kind = "http"` with a fixed base URL, allowed methods and paths, a
+   what is shown is still exactly what is approved (§7). To be designed when picked; one option
+   is an external formatter whose output the broker checks equals the input up to whitespace.
+5. **An MCP client as a resource executable.** Some integrations exist only as MCP servers. A
+   wrapper runs the server with its credential, confined like any resource that processes agent
+   input with one, and makes one tool call per request, with the arguments as JSON on stdin.
+6. **HTTP resources**: `kind = "http"` with a fixed base URL, allowed methods and paths, a
    credential injected on the privileged side, and JSON review hints. Most SaaS reads,
-   declaratively; the fixed base URL satisfies the credential rules by construction.
-8. **A git credential helper backed by priviledge**, removing the last native token (§5).
-9. **A privileged-only approval interface for scripting** (`queue`, `approve`, `deny`).
-10. **An MCP adapter for the client's own commands** (`priviledge mcp`), only if a client needs
-    it and it shows value over its cost. The CLI is POSIX-composable, works in every agent, and
-    keeps the surface small and free of MCP spec churn.
+   declaratively; the fixed base URL satisfies the credential rules by construction. To be
+   weighed against the principles (§2) when picked: a wrapper executable can do the same.
+7. **An MCP adapter for the client's own commands** (`priviledge mcp`), only if a client needs
+   it and it shows value over its cost. The CLI is POSIX-composable, works in every agent, and
+   keeps the surface small and free of MCP spec churn.
+8. **Egress approval**: the deployment's egress proxy asks priviledge before allowing a new host,
+   so the human approves domains the way they approve requests. It needs a way for the proxy to
+   reach the broker, which listens on nothing today.
 
 ## 11. Open questions
 
 - Which SaaS tokens can actually be scoped read-only (trackers, code hosts, chat) **(verify)**.
-- Head/tail preview size in the approval prompt.
-- Whether requests should survive a broker restart. For now they don't; the audit log is the
-  record.

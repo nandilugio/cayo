@@ -517,6 +517,20 @@ git config transfer.fsckObjects true
   refuse malformed ones, before storing it.
 - A `public` guest of the same project gets its own remote (`aiws-public`).
 
+**Short-lived fetch tokens (optional).** Instead of a stored token, a git credential helper in the
+guest asks priviledge for one on each use. A `git-token` resource mints a short-lived, read-only
+token (for example a one-hour app installation token) and prints it in git's credential format;
+auto-approved and released unreviewed in `trusted`. The token still enters the guest (SPEC.md
+§5), but it expires, and every use is in the audit log. **(verify)**
+
+```sh
+#!/bin/sh
+# ~/.local/bin/git-credential-priviledge, in the guest: git config credential.helper priviledge
+[ "$1" = get ] || exit 0
+id=$(priviledge request git-token -r "git credential for a fetch" </dev/null) &&
+  priviledge wait "$id" && exec priviledge retrieve "$id"
+```
+
 **Two-pass review:**
 
 1. *Comprehension pass* in the guest, with full nvim and LSP navigation. Comfortable, but not

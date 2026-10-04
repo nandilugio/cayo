@@ -187,20 +187,23 @@ writing the last byte to its stdout without error, and only then does the broker
 **Results are spooled, not held.** A resource's stdout is captured with
 `tempfile.SpooledTemporaryFile`: in memory up to a threshold (1 MiB), then rolled over to a file in
 the broker's private temp directory (§8). A rolled-over spool file has no path, so the prompt's
-head/tail preview reads the spool, and `view` and `edit` first write a named copy, with the
-extension from `output_syntax`, into the same directory. An edited copy becomes the released
-result. Output stops at a per-request cap (default 64 MiB): the resource is stopped and the request
-becomes `failed` with the output written up to the cap. `retrieve` exits 1, and a `priviledge:`
-line on stderr says the cap was reached, the output is partial, and the request should be
-narrowed. A resource's `timeout` (SPEC.md §8) ends the same way, the line saying it timed out. Memory
-stays flat whatever the result size, and waiting results cost disk, not RAM.
+head/tail preview reads the spool (10 lines each, a whole request up to 20 lines, §12), and `view`
+and `edit` first write a named copy, with the extension from `output_syntax`, into the same
+directory. An edited copy becomes the released result. Output stops at a per-request cap (default
+64 MiB): the resource is stopped and the request becomes `failed` with the output written up to the
+cap. `retrieve` exits 1, and a `priviledge:` line on stderr says the cap was reached, the output is
+partial, and the request should be narrowed. A resource's `timeout` (SPEC.md §8) ends the same way,
+the line saying it timed out. Memory stays flat whatever the result size, and waiting results cost
+disk, not RAM.
 
 When the channel ends, the broker marks the guest offline and applies the rules in SPEC.md §6:
 requests that have not started become `dropped` (exit 249 on `retrieve`); requests that are
 running, awaiting release or settled are kept and flagged "not retrieved". It then restarts the
 channel with backoff. When the relay's stdin closes or its heartbeat lapses, it removes its socket
 and exits, so clients fail fast with "broker not connected" (exit 254). A broker restart loses the
-in-memory requests; the audit log (§8) is the record.
+in-memory requests; the audit log (§8) is the record. Quitting `serve` with requests outstanding
+asks for confirmation first; on quit, running resources are stopped and each request's last step
+is logged.
 
 ## 6. Framing
 
@@ -267,13 +270,14 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
   removing, the stdlib's pure-Python scanner can be forced, at some cost in speed. A Rust rewrite
   fits as a "once the design stops changing" step.
 
-## 10. Session resources (backlog)
+## 10. Session holder (backlog)
 
-A sketch for SPEC.md §8's session resources: the broker holds the process on a pty, the human sees
-it start in the approval pane and completes any interactive authentication there, each approved
-snippet is written to the session followed by a sentinel, and output is captured up to the
-sentinel. It also needs handling for output interleaved with prompts, keepalive, and
-cancellation. Local clients such as psql would run confined, per SPEC.md §8's input
+A sketch for SPEC.md §8's session holder, a tool separate from the broker: it holds the process on
+a pty in its own terminal, where the human sees it start and completes any interactive
+authentication, and listens on a privileged-only Unix socket. The resource executable sends each
+approved snippet there; the holder writes it to the session followed by a sentinel and returns
+the output up to the sentinel. It also needs handling for output interleaved with prompts,
+keepalive, and cancellation. Local clients such as psql would run confined, per SPEC.md §8's input
 rules. Details are open (§12).
 
 ## 11. First iterations
@@ -305,4 +309,5 @@ ships (SPEC.md §10).
   request and restart counts (§5).
 - **(verify)** what the relay sees when `serve` is killed hard, per runtime (end-of-file or
   nothing). The heartbeat covers both, but it tells us how long orphans linger.
-- Session resources: sentinel robustness, prompt noise, long-running statements, cancellation.
+- Preview sizes (10 + 10 lines; whole requests up to 20), tuned in use (§5).
+- Session holder: sentinel robustness, prompt noise, long-running statements, cancellation.
