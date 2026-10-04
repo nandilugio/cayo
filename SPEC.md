@@ -323,8 +323,8 @@ one thing, so any of them can be composed with other tools without ambiguity.
 - `priviledge retrieve <id>`: write the result to stdout. Never blocks: if the request is not
   settled, it exits with a distinct status.
 - `priviledge pending`: this guest's requests not yet retrieved, with resource and state.
-- `priviledge cancel <id>`: withdraw a request that is still queued (waiting for approval or for
-  its turn). It is discarded.
+- `priviledge cancel <id>`: withdraw a request that has not started (waiting for approval or for
+  a free slot of its resource, §8). It is discarded.
 
 ```sh
 id=$(priviledge request prod-db-ro -r "count overdue orders by region" <<'SQL'
@@ -348,6 +348,10 @@ priviledge wait "$a" "$b" && priviledge retrieve "$a" | jq ... && priviledge ret
 - `wait` with a timeout exists because agent shell tools have hard timeouts (two minutes by
   default in some, ten at most). A timed-out `wait` changes nothing: the agent waits again.
 - A client that exits does not cancel its request. `pending` recovers ids the agent lost.
+- **No order between outstanding requests.** Requests outstanding at the same time may run
+  concurrently and finish in any order, whatever their resource: the same contract as concurrent
+  HTTP calls. An agent that needs one request's effect before another's waits for and retrieves
+  the first, which also lets it act on the outcome (the first may be denied or fail).
 - **Request ids are opaque and random** (for example `k7f2qa-3mxp9dq2vt`). They are long enough
   that in practice they don't repeat for a guest, not even across broker restarts, and they say
   nothing about how many other requests exist. An id from before a restart is reported as lost
@@ -368,13 +372,13 @@ client's own codes cannot collide with theirs:
 | Code | Meaning | Commands | The agent should |
 |---|---|---|---|
 | 0 | Success. For `retrieve`: the resource succeeded and its output is on stdout | all | |
-| 1 | The resource failed. stdout carries whatever the resource chose to tell the agent | `retrieve` | Read stdout |
+| 1 | The resource failed. stdout carries whatever the resource chose to tell the agent; if the broker stopped it at its timeout or the output cap (§8), stdout holds what it wrote until then and stderr says which, and that the output may be partial | `retrieve` | Read stdout |
 | 248 | Lost: the broker restarted before the request was retrieved. stderr says whether it had started | `wait`, `retrieve` | Check its effects before repeating it, if it may have run |
 | 249 | Dropped: the broker connection was lost before the request ran; nothing happened | `retrieve` | Request again |
 | 250 | Not settled (`retrieve`), or timed out (`wait`) | `wait`, `retrieve` | Wait again |
-| 251 | Denied by the human, the request or the release of its output, with their message on stderr | `retrieve` | Not repeat it as is |
+| 251 | Denied by the human: the request, the release of its output, or the request while it ran (killed, §7), with their message on stderr | `retrieve` | Not repeat it as is; if it was killed while running, check its effects |
 | 252 | Unknown id: never existed, already retrieved, or cancelled by the agent | `wait`, `retrieve`, `cancel` | Nothing to fetch |
-| 253 | Invalid request: unknown resource, undeclared input, missing reason, payload too large, too many outstanding requests, or `cancel` on a request that is no longer queued | `request`, `describe`, `cancel` | Fix the call, or retrieve or cancel outstanding requests |
+| 253 | Invalid request: unknown resource, undeclared input, missing reason, payload too large, too many outstanding requests, or `cancel` on a request that has started | `request`, `describe`, `cancel` | Fix the call, or retrieve or cancel outstanding requests |
 | 254 | Broker not connected | all | Retry once it is back |
 
 Codes 248–254 are outside the ranges ordinary tools and shells use. Every non-zero exit comes
@@ -393,31 +397,54 @@ with a one-line `priviledge: ...` message on stderr.
 ## 7. Approval
 
 Each guest has its own approval prompt, on the terminal where the human runs
-`priviledge serve <profile> <name>`. The prompt is line-oriented, like `git add -p`:
+`priviledge serve <profile> <name>`. The prompt is line-oriented, like `git add -p`. Layouts and
+wording in this section are examples; the behaviour is what is specified.
 
 ```
-[3mxp9dq2vt] trusted/shop · prod-db-ro
+[3mxp9dq2vt] trusted/shop · prod-db-ro               running: aws-readonly 1 · waiting: 1 run
      reason: count overdue orders by region
      SELECT region, count(*) FROM orders WHERE status = 'open' GROUP BY region
-run? [y]es [Y]es+release [n]o(+msg) [s]kip [e]dit [v]iew [?]
-[3mxp9dq2vt] exit 0 · 214 lines · 6.1 KB · 1.4 s
+run? [y]es [Y]es+release [n]o(+msg) [s]kip [e]dit [v]iew [r]unning [?]
+  · [k7f2qa01ab] aws-readonly · exit 0 · 12 lines · released (auto)
+[3mxp9dq2vt] run? [y]es [Y]es+release [n]o(+msg) [s]kip [e]dit [v]iew [r]unning [?]
+...
+[3mxp9dq2vt] trusted/shop · prod-db-ro · exit 0 · 214 lines · 6.1 KB · 1.4 s   waiting: 1 run
+     reason: count overdue orders by region
+    request: SELECT region, count(*) FROM orders WHERE status = 'open' GROUP BY region
      region,count
      eu-west,412
      ... (first/last lines)
-release? [y]es [n]o(+msg) [v]iew [e]dit/redact
+release? [y]es [n]o(+msg) [v]iew [e]dit/redact [r]unning [?]
 ```
 
 - The guest (`profile/name`) is established by the broker and is authoritative. The reason is the
   agent's text and is shown as such.
-- **Requests are handled one at a time, in arrival order**: a request runs only after the previous
-  one is settled or skipped. `Y` approves and releases the output without a second prompt, for
-  requests whose result the human does not need to see. `s` leaves a request pending and moves on;
-  it comes back at the end of the queue. Concurrent execution is in the backlog (§10).
-- Requests that need no confirmation still get a one-line entry in the pane, so the human sees
-  everything that runs.
-- The resource's stderr (§8) is shown in the pane and never sent to the guest.
-- Notification of a new prompt is configurable per profile (`notify`, §8): a terminal bell, a
-  command, or nothing.
+- **One prompt at a time, many requests running.** Approved requests run concurrently, up to
+  each resource's `concurrency` (§8); the human answers one prompt at a time. `Y` approves and
+  releases the output without a second prompt, for requests whose result the human does not
+  need to see.
+- **Prompt order.** Approval prompts come before release prompts: approving costs one key and
+  starts work, so a burst is approved first and runs while results are reviewed. Among release
+  prompts, those that complete a blocked `wait` (every other id it waits for is settled) come
+  first, since that result is what unblocks an agent; the rest follow in arrival order. `s` moves
+  a prompt to the back of its kind. This order needs no knowledge of which agent sent what, and
+  it can only reorder the guest's own prompts, never change what is shown or decided.
+- **A prompt never changes under the human.** The active prompt ends only with their input. Keys
+  typed before a prompt is drawn are discarded, so each key answers a prompt that was on screen.
+- **Everything that runs is shown.** Requests that need no confirmation, results released
+  without review, failures and channel events each get a one-line entry. One that arrives while a
+  prompt waits is printed, and the prompt line repeated with its request id; while the human
+  types a message or works in the pager or editor, entries are held until they finish.
+- **Each prompt header carries the state**: requests running per resource, and prompts waiting
+  of each kind. A write approved while another on the same resource still runs is visible as
+  such.
+- **Release prompts repeat their context**: reason and request above the output, since a result
+  can arrive long after its approval.
+- The resource's stderr (§8) is never sent to the guest. Its tail is shown with the request's
+  release prompt or completion entry, and all of it through `view`, the running view (below) and
+  the audit log.
+- Notification is configurable per profile (`notify`, §8): a terminal bell, a command, or
+  nothing. It fires when the pane goes from idle to having a prompt, not for each queued one.
 - **All agent-supplied text is rendered with control characters escaped.** Requests and outputs
   must not be able to move the cursor, hide lines, restyle the prompt, or send queries to the
   terminal.
@@ -436,6 +463,26 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact
   case and deserves the smallest surface (a pager interprets nothing and streams any size), and
   because a viewer can't change what is being approved. An **edit is a change in content**: a
   file saved unchanged counts as a view, and the agent gets no edit notice for it.
+
+### Running requests
+
+`r` at any prompt lists the running requests, with what helps decide whether one is stuck: time
+running, output size so far, and the last line of its stderr. Selecting one offers:
+
+```
+running:
+  1 [k7f2qa01ab] prod-db-ro · 4m12s · 0 B out · stderr: (none)
+  2 [9dq2vtx0mm] aws-readonly · 38s · 1.2 MB out · stderr: Retrying (3/5)...
+which? 1
+[k7f2qa01ab] [o]utput [e]rrors [k]ill(+msg) [b]ack
+```
+
+- `o` and `e` open the review pager on a snapshot of the stdout or stderr written so far; again
+  for a newer one.
+- `k` kills the request, with an optional message as for `n`. It is a denial of a running
+  request: its partial output is discarded, and the agent gets 251 with the message and a note
+  that the request was stopped while running, so it may have had effects.
+- `b` returns to the prompt queue.
 
 ### Review surfaces run as privileged over hostile content
 
@@ -552,6 +599,8 @@ is why the confirmation settings live here.
 | `params` | Table of named parameters and their descriptions. Undeclared parameters are rejected |
 | `input_syntax`, `output_syntax` | Review hints: the file extension used for `view`/`edit` |
 | `write_credential` | `true` if the resource's credential can change state. Default `false`. The human's declaration of what the credential enforces |
+| `concurrency` | How many of its requests may run at once, per guest. Default `1`. Approved requests beyond it wait for a free slot. It bounds the load on the service and keeps serial resources serial; it is not an ordering guarantee (§6) |
+| `timeout` | Seconds a request may run before the broker stops it. Default `300`: long enough for a slow query, short enough to bound a broken setup. Only execution counts, not waiting for approval or a slot. A stopped request fails with the output it wrote so far (§6, exit 1) |
 
 ### The resource contract
 
@@ -630,7 +679,9 @@ SETUP.md shows two example wrappers written to these rules.
 **Read-only is not harmless on a primary database.** A read-only role can't write, but an
 auto-approved query can still load production. Bound the cost with a `statement_timeout` on the
 role or the connection, and have the client send exactly one statement per request: a `SET`
-earlier in the same request would lift the timeout.
+earlier in the same request would lift the timeout. The load is that timeout times the queries
+running at once: bound those with the resource's `concurrency`, which counts per guest, and
+across guests with a connection limit on the role.
 
 An auto-approved resource with `args = true` exposes everything its credential can read (§5,
 condition 2): a read-only cloud role can often read parameters, secrets stores and object storage.
@@ -676,39 +727,35 @@ current intent, not a plan. Releases use semantic versioning, `0.x` while the in
 document may still change, `1.0` when they stop.
 
 1. **The core**: resources, profiles, the client (`list`, `describe`, `request`, `wait`,
-   `retrieve`, `pending`, `cancel`), the sequential approval prompt with both confirmations and
-   output review, the audit log.
+   `retrieve`, `pending`, `cancel`), concurrent execution with per-resource `concurrency` and
+   `timeout`, the approval prompt with both confirmations, output review and the running view,
+   the audit log.
 2. **Checkers**: privileged-owned executables that receive a request before the prompt and return
    *pass*, *flag* (with a note the prompt shows) or *block*. Pattern rules first; other kinds
    possible. They follow the review-surface rule (§7) and the resource input rules (§8).
-3. **Concurrent execution**: several approved requests running at once, with their release
-   prompts queued. Needs its own UX pass.
-4. **Session resources** (§8).
-5. **Review formatting**: formatters for the inline prompt that only insert whitespace and
+3. **Session resources** (§8).
+4. **Review formatting**: formatters for the inline prompt that only insert whitespace and
    colour (pattern-based, per `input_syntax`/`output_syntax`) and never rebuild the content, so
    what is shown is still exactly what is approved (§7).
-6. **Egress approval**: the deployment's egress proxy asks priviledge before allowing a new host,
+5. **Egress approval**: the deployment's egress proxy asks priviledge before allowing a new host,
    so the human approves domains the way they approve requests.
-7. **MCP servers on the privileged side.** Some integrations exist only as MCP servers. The broker
+6. **MCP servers on the privileged side.** Some integrations exist only as MCP servers. The broker
    runs them, with their credentials, and the client exposes them to the guest through a stdio
    adapter that forwards only `tools/list` and `tools/call`; each call is a request with the
    profile's confirmation settings, per tool. The server processes agent input with a credential,
    so it runs confined, like any resource that does.
-8. **HTTP resources**: `kind = "http"` with a fixed base URL, allowed methods and paths, a
+7. **HTTP resources**: `kind = "http"` with a fixed base URL, allowed methods and paths, a
    credential injected on the privileged side, and JSON review hints. Most SaaS reads,
    declaratively; the fixed base URL satisfies the credential rules by construction.
-9. **A git credential helper backed by priviledge**, removing the last native token (§5).
-10. **Burst approvals**: "approve the rest from this resource for N minutes", read-only resources
-    only.
-11. **A privileged-only approval interface for scripting** (`queue`, `approve`, `deny`).
-12. **An MCP adapter for the client's own commands** (`priviledge mcp`), only if a client needs
+8. **A git credential helper backed by priviledge**, removing the last native token (§5).
+9. **A privileged-only approval interface for scripting** (`queue`, `approve`, `deny`).
+10. **An MCP adapter for the client's own commands** (`priviledge mcp`), only if a client needs
     it and it shows value over its cost. The CLI is POSIX-composable, works in every agent, and
     keeps the surface small and free of MCP spec churn.
 
 ## 11. Open questions
 
 - Which SaaS tokens can actually be scoped read-only (trackers, code hosts, chat) **(verify)**.
-- Cancelling a running request from the approval prompt, and whether resources need a timeout.
 - Head/tail preview size in the approval prompt.
 - Whether requests should survive a broker restart. For now they don't; the audit log is the
   record.

@@ -24,38 +24,54 @@ that guest, and each guest gets its own approval pane. The guest is identified e
 **Request states.** Each request carries one explicit state, and transitions are the only
 place it changes:
 
-```
-pending-approval ──▶ executing ──▶ pending-release ──▶ deliverable (exit 0) ─┐
-      │                                   │        └─▶ failed (exit≠0) ──────┤
-      │ n                                 │ n                                │
-      ▼                                   ▼                                  │
-   denied                           release-denied                           ├──▶ retrieved: deleted
-      │                                   │                                  │
-      └───────────────────────────────────┴──────────────────────────────────┤
-pending-approval ──▶ dropped  (channel lost) ────────────────────────────────┘
-```
+| From | Event | To |
+|---|---|---|
+| (arrival) | `confirm_request` | `pending-approval` |
+| (arrival) | no `confirm_request` | `queued` |
+| `pending-approval` | `y` or `Y` | `queued` |
+| `pending-approval` | `n` | `denied` |
+| `queued` | a slot of its resource is free | `executing` |
+| `executing` | exits or is stopped (timeout, output cap), with output to review | `pending-release` |
+| `executing` | exits or is stopped, nothing to review | `deliverable` (exit 0) or `failed` |
+| `executing` | `k` (kill) | `denied` |
+| `pending-release` | `y` | `deliverable` or `failed`, by exit status |
+| `pending-release` | `n` | `release-denied` |
+| `pending-approval`, `queued` | channel lost | `dropped` |
+| `pending-approval`, `queued` | `cancel` | deleted |
+| any terminal state | complete `retrieve` | deleted |
 
-- A request enters `pending-approval` on arrival; the client gets its id at once. With
-  `confirm_request = false` it is not prompted, and enters `executing` when its turn comes
-  (below). With `confirm_output = false` (or the human's `Y`) execution goes straight to
-  `deliverable` or `failed`, by exit status. Checkers, later, run on entering `pending-approval`.
+- The client gets its id on arrival. Checkers, later, run before `pending-approval`.
+- An execution has output to review unless `confirm_output = false`, the human answered `Y`, or
+  there is nothing to review (below).
 - Failures are reviewed like results: stdout may hold partial data, such as rows written before a
-  timeout. A failed execution skips review only when there is nothing to review: its stdout is
-  empty, or it was killed at the output cap (§5).
-- The five states that lead to `retrieved` are **terminal**: the request is settled (SPEC.md §6) and
-  holds whatever `retrieve` will answer: the result, the resource's stdout on failure, or the
-  human's message. `retrieve` is a pull, so no state is needed for a delivery that breaks off: the
-  request stays terminal and the next `retrieve` starts over. A complete `retrieve` deletes the
-  request.
-- `cancel` deletes a request in `pending-approval`; afterwards its id is unknown.
-- `s` (skip) leaves the state as is and moves the request to the back of the prompt order.
+  statement timeout. A failed execution skips review only when its stdout is empty. A request the
+  broker stops at its `timeout` or the output cap is a failure whose stdout keeps what was written
+  (§5).
+- A stop (timeout, output cap) or a kill ends the resource's process group (it runs in its own
+  session, below). A kill records the request as denied while running, which the agent is told,
+  and releases nothing (SPEC.md §7).
+- `denied`, `release-denied`, `deliverable`, `failed` and `dropped` are **terminal**: the request
+  is settled (SPEC.md §6) and holds whatever `retrieve` will answer: the result, the resource's
+  stdout on failure, or the human's message. `retrieve` is a pull, so no state is needed for a
+  delivery that breaks off: the request stays terminal and the next `retrieve` starts over. A
+  complete `retrieve` deletes the request.
+- `cancel` deletes a request that has not started; afterwards its id is unknown.
+- `s` (skip) leaves the state as is and moves the request to the back of its kind of prompt.
 
 **One event loop, no threads.** The broker is a single `selectors` loop over the channel pipe, the
-running resource's stdout and stderr, the terminal, and a heartbeat timer. "The prompt queue" and
-"the outbox" are views over state (requests in a `pending-*` state in arrival order; requests in a
-terminal state), not separate structures. Requests run one at a time (SPEC.md §7): the next
-request is prompted, or if auto-approved started, only when no request is `executing` or
-`pending-release`.
+running resources' stdout and stderr, the terminal, and timers (heartbeat, resource timeouts).
+Queues are views over state, not separate structures:
+
+- **Slots.** A `queued` request starts when fewer than its resource's `concurrency` requests are
+  `executing`, in the order requests became `queued`.
+- **Prompts.** `pending-approval` requests in arrival order, then `pending-release` ones: first
+  those that complete a blocked `wait`, then the rest in arrival order (SPEC.md §7). The broker
+  knows each open `wait` and the ids it lists, since it answers them when they settle.
+- **Outbox.** Requests in a terminal state.
+
+Only the active prompt reads the terminal. Input that arrives before a prompt is drawn is
+flushed (`termios.tcflush`), and entries for other requests are printed between prompts, or held
+while the human types a message (SPEC.md §7).
 
 The review pager and editor take over the terminal, but the loop keeps running underneath them:
 the tool runs as a child, the loop keeps answering heartbeats and clients, and pane output is
@@ -66,7 +82,8 @@ Resources run as child processes of the broker, in their own session without a c
 terminal, with stdin, stdout and stderr connected to the request, and with the fixed environment
 of SPEC.md §8 (`PATH`, `HOME`, `USER`, `LANG`/`LC_*`, `PRIVILEDGE_P_*`) built from scratch rather
 than filtered. They can't prompt on, or write to, the approval pane. The broker collects stdout as
-the result and stderr for the pane and the log (SPEC.md §8, the resource contract).
+the result and stderr for the pane and the log (SPEC.md §8, the resource contract), both spooled
+(§5), so the running view (SPEC.md §7) can show a snapshot of either at any time.
 
 ## 2. Configuration resolution
 
@@ -172,9 +189,10 @@ writing the last byte to its stdout without error, and only then does the broker
 the broker's private temp directory (§8). A rolled-over spool file has no path, so the prompt's
 head/tail preview reads the spool, and `view` and `edit` first write a named copy, with the
 extension from `output_syntax`, into the same directory. An edited copy becomes the released
-result. Output stops at a per-request cap (default 64 MiB): the resource is
-killed, the partial output is discarded, and the request becomes `failed`: `retrieve` exits 1 with
-empty stdout and a `priviledge:` line on stderr telling the agent to narrow its request. Memory
+result. Output stops at a per-request cap (default 64 MiB): the resource is stopped and the request
+becomes `failed` with the output written up to the cap. `retrieve` exits 1, and a `priviledge:`
+line on stderr says the cap was reached, the output is partial, and the request should be
+narrowed. A resource's `timeout` (SPEC.md §8) ends the same way, the line saying it timed out. Memory
 stays flat whatever the result size, and waiting results cost disk, not RAM.
 
 When the channel ends, the broker marks the guest offline and applies the rules in SPEC.md §6:
@@ -266,13 +284,15 @@ ships (SPEC.md §10).
 1. **Environment** ([SETUP.md](SETUP.md)): the guest runtime, the profile images, one `trusted`
    guest, egress for it, the tmux layout, and the verification checklist. Building the rest
    *inside* the real boundary surfaces the true frictions instead of guessing them.
-2. **Core loop, minimal:** `serve` with configuration resolution, the channel and relay, one exec
-   resource, `request`/`wait`/`retrieve` and the sequential prompt with both confirmations.
+2. **Core loop, minimal:** `serve` with configuration resolution, the channel and relay, one
+   resource, `request`/`wait`/`retrieve` and the prompt with both confirmations, with requests
+   running concurrently up to each resource's `concurrency`.
    Against a local dev database, with the Postgres example resource of SETUP.md §9 built and
    tested here. The channel parser and schema checks are fuzzed with malformed and adversarial
    input from this iteration on.
 3. **Core loop, complete:** `list`, `describe`, `pending`, `cancel`, output review with the
-   external pager and editor, the audit log, a read-only cloud resource.
+   external pager and editor, timeouts and the running view, the audit log, a read-only cloud
+   resource.
 4. **Git and deploy flow** (SETUP.md): clean clones, the `ext::` remote, push and deploy from a
    reviewed commit.
 5. The rest of the backlog, in the order decided at the time.

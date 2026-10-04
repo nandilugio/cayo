@@ -23,7 +23,7 @@ credentials:
 │     reason: links idle 90+ days                                                      │
 │     SELECT count(*) FROM links                                                       │
 │      WHERE last_opened < now() - interval '90 days'                                  │
-│ run? [y]es [Y]es+release [n]o(+msg) [s]kip [e]dit [v]iew [?] █                       │
+│ run? [y]es [Y]es+release [n]o(+msg) [s]kip [e]dit [v]iew [r]unning [?] █             │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
