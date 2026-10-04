@@ -405,8 +405,28 @@ choice matters:
   Tool-specific settings go in the list itself, e.g. `["env", "LESSHISTFILE=-", "less", ...]`.
 - The default pager is `less -+r -+R --no-lessopen`; the `-+` options reset raw control
   characters whatever a lesskey file says.
-- The default editor, `vi`, is vim on many systems and loads the human's own vimrc and plugins,
-  with modelines on. Set the editor explicitly rather than relying on it.
+- The default editor, `vi -u NONE -i NONE -n -c "set nocompatible nomodeline"`, loads nothing:
+  no vimrc, no plugins, no syntax colouring. `-u NONE` starts vim in compatible mode, where
+  modelines are off when the file is read; `-c` then restores normal vim editing and keeps
+  modelines off. Checked on Debian 13 and Ubuntu 24.04 (vim-tiny), Fedora 44 (vim-minimal) and
+  macOS 15: a modeline that fires when forced on is ignored. On all three Linux systems the
+  minimal package provides `vi` but no `vim`, hence the name.
+- With full vim, colour comes from a privileged-owned vimrc that leaves the human's `~/.vim` out
+  of the runtime path (`vim --clean` doesn't do: it leaves compatible mode after `--cmd` runs,
+  which turns modelines back on). Checked on macOS's vim 9.1:
+
+  ```toml
+  [review]
+  editor = ["vim", "-u", "~/.priviledge/review.vim", "-i", "NONE", "--noplugin"]
+  ```
+
+  ```vim
+  " ~/.priviledge/review.vim
+  set nocompatible
+  set runtimepath=$VIMRUNTIME packpath=
+  set nomodeline noswapfile noundofile viminfo=
+  syntax on
+  ```
 - A minimal nvim serves as both, the pager in read-only mode:
 
   ```toml

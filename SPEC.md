@@ -467,9 +467,14 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact [r]unning [?]
   with the review editor. Both are argv lists in the configuration (`[review]`, §8), run without a
   shell, with the file's path appended as the last argument, and with the same fixed environment
   as resources (§8) plus `TERM` and `COLORTERM`: variables exported where `serve` started (`LESS`,
-  `LESSOPEN`, `VIMINIT`) can't change how they treat the content. The defaults are
-  `less -+r -+R --no-lessopen` (raw control characters off, input preprocessor disabled) and `vi`.
-  Both still load the human's own settings files for those tools; SETUP.md describes safe choices.
+  `LESSOPEN`, `VIMINIT`) can't change how they treat the content. The defaults work out of the
+  box and are safe as they are:
+  - pager: `less -+r -+R --no-lessopen`: raw control characters off, input preprocessor disabled.
+  - editor: `vi -u NONE -i NONE -n -c "set nocompatible nomodeline"`: no vimrc or plugins, no
+    viminfo, no swap file, modelines off, normal vim editing. `vi` because that is the only name
+    vim has on minimal installs (Debian and Ubuntu's vim-tiny, Fedora's vim-minimal).
+
+  SETUP.md describes richer choices.
 - The two settings may name the same program. They are separate because viewing is the common
   case and deserves the smallest surface (a pager interprets nothing and streams any size), and
   because a viewer can't change what is being approved. An **edit is a change in content**: a
