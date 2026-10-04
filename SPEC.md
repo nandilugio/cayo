@@ -436,7 +436,9 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact [r]unning [?]
   request has been opened with `v` or `e`: a line buried in the middle of a long request is
   exactly what a hostile agent would hide. Outputs need no full view before release; `v` shows
   them whole.
-- **A prompt never changes under the human.** The active prompt ends only with their input. Keys
+- **A prompt never changes under the human.** The active prompt ends with their input, or is
+  withdrawn with an entry saying why when its request is cancelled by the agent or dropped with
+  the channel; a withdrawal can only remove a request, never put another in its place. Keys
   typed before a prompt is drawn are discarded, so each key answers a prompt that was on screen.
 - **Everything that runs is shown.** Requests that need no confirmation, results released
   without review, failures and channel events each get a one-line entry. One that arrives while a
@@ -458,9 +460,8 @@ release? [y]es [n]o(+msg) [v]iew [e]dit/redact [r]unning [?]
 - The inline prompt shows the content as it is, escaped, never reformatted: a view rebuilt from
   parsed content can differ from what is approved (a JSON object with a duplicate key shows only
   one of them). The prompt shows sizes, and content longer than its preview as head and tail with
-  what is omitted. Output is limited only by a
-  per-request cap (a resource that exceeds it fails, telling the agent to narrow the request);
-  request payloads are capped too (§3).
+  what is omitted. Output is limited only by a per-request cap (a resource that exceeds it fails,
+  telling the agent to narrow the request); request payloads are capped too (§3).
 - `view` opens the content in `$PRIVILEDGE_REVIEW_PAGER`, from a privileged-owned temp file whose
   extension comes from the resource's `input_syntax` / `output_syntax` (§8). `edit` does the same
   with `$PRIVILEDGE_REVIEW_EDITOR`. Both are argv strings, run without a shell, with the file's
@@ -503,8 +504,8 @@ settles it:
 > priviledge itself renders untrusted content only as escaped plain text, with the standard
 > library and no parser. Any richer view (syntax colour, diffing, folding) is delegated to an
 > external tool the human chooses, which works on a privileged-owned *copy* of the content and
-> must never execute anything from it. priviledge's own surface stays small and
-> auditable; the richer tool's surface is the human's explicit choice.
+> must never execute anything from it. priviledge's own surface stays small and auditable; the
+> richer tool's surface is the human's explicit choice.
 
 For those external tools: no LSP, ever (LSP servers execute project code); syntax highlighting is
 a small, accepted risk (in-process parsers of untrusted input, with a history of memory-safety
@@ -590,7 +591,7 @@ The broker validates at start:
 | Field | Meaning |
 |---|---|
 | `guest_exec` | The command that runs a program inside a guest (§4, item 2), as an argv list with `{profile}` and `{name}` substituted; priviledge appends its own program name and arguments. Required for a profile with resources |
-| `notify` | `"bell"`, `"none"`, or an argv list to run on each new prompt. Default `"bell"` |
+| `notify` | `"bell"`, `"none"`, or an argv list, run when the pane goes from idle to having a prompt (§7). Default `"bell"` |
 | `resources.<resource>` | Makes the resource available to guests of this profile. Keys: `confirm_request` (approve before running), `confirm_output` (approve before releasing the output); both default `true` |
 
 Whether to trust a resource unattended is a property of the profile, not of the resource, which
@@ -617,8 +618,8 @@ A resource has one audience on each side, and the broker keeps them apart:
 - **stdout is for the agent.** Whatever the resource writes there is the result, released to the
   guest after review (or at once, if the profile says so).
 - **stderr is for the human.** Diagnostics, the wrapped tool's own errors, anything that mentions
-  hosts, users or paths. It is shown in the approval pane and written to the audit log, and never
-  sent to the guest.
+  hosts, users or paths. Its tail is shown in the approval pane and all of it on request (§7), it
+  is written to the audit log, and it is never sent to the guest.
 - **Exit 0 is success; any other status is failure.** The status itself is not forwarded. A
   resource that wants the agent to know *why* it failed writes that to stdout before exiting
   ("syntax error at line 3"), and leaves out what the agent has no business knowing ("connection
@@ -729,8 +730,9 @@ broker run marked so that a guest recreated under the same name stays distinguis
 carry: request id, reason, the request as submitted and as run (if edited), decisions,
 timestamps, exit status, the resource's stderr, output size and a hash of the output, and the
 original output when the released one was changed. Output bodies are not logged otherwise.
-Each step of a request (received, decided, started, finished, released, retrieved, or cancelled or
-dropped) is recorded as it happens, so a crash leaves a record of how far every request got.
+Each step of a request (received, decided, started, finished, stopped or killed, released,
+retrieved, cancelled, dropped) is recorded as it happens, so a crash leaves a record of how far
+every request got.
 
 ## 10. Backlog
 

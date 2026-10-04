@@ -70,8 +70,10 @@ Queues are views over state, not separate structures:
 - **Outbox.** Requests in a terminal state.
 
 Only the active prompt reads the terminal. Input that arrives before a prompt is drawn is
-flushed (`termios.tcflush`), and entries for other requests are printed between prompts, or held
-while the human types a message (SPEC.md §7).
+flushed (`termios.tcflush`); a prompt whose request is cancelled or dropped is withdrawn with an
+entry, and a key in flight either lands on the withdrawn request, where it does nothing, or is
+flushed; entries for other requests are printed between prompts, or held while the human types a
+message (SPEC.md §7).
 
 The review pager and editor take over the terminal, but the loop keeps running underneath them:
 the tool runs as a child, the loop keeps answering heartbeats and clients, and pane output is
@@ -184,17 +186,17 @@ A settled request keeps its result until a `retrieve` completes: the client send
 writing the last byte to its stdout without error, and only then does the broker delete the request
 (SPEC.md §6). A `retrieve` that ends early (broken pipe, killed client) leaves the result in place.
 
-**Results are spooled, not held.** A resource's stdout is captured with
-`tempfile.SpooledTemporaryFile`: in memory up to a threshold (1 MiB), then rolled over to a file in
-the broker's private temp directory (§8). A rolled-over spool file has no path, so the prompt's
-head/tail preview reads the spool (10 lines each, a whole request up to 20 lines, §12), and `view`
-and `edit` first write a named copy, with the extension from `output_syntax`, into the same
-directory. An edited copy becomes the released result. Output stops at a per-request cap (default
-64 MiB): the resource is stopped and the request becomes `failed` with the output written up to the
-cap. `retrieve` exits 1, and a `priviledge:` line on stderr says the cap was reached, the output is
-partial, and the request should be narrowed. A resource's `timeout` (SPEC.md §8) ends the same way,
-the line saying it timed out. Memory stays flat whatever the result size, and waiting results cost
-disk, not RAM.
+**Results are spooled, not held.** A resource's stdout, and its stderr the same way, is captured
+with `tempfile.SpooledTemporaryFile`: in memory up to a threshold (1 MiB), then rolled over to a
+file in the broker's private temp directory (§8). A rolled-over spool file has no path, so the
+prompt's head/tail preview (10 lines each; a request is shown whole up to 20 lines, §12) reads the
+spool, and `view` and `edit` first write a named copy, with the extension from `output_syntax`, into
+the same directory. An edited copy becomes the released result. Output stops at a per-request cap
+(default 64 MiB): the resource is stopped and the request becomes `failed` with the output written
+up to the cap. `retrieve` exits 1, and a `priviledge:` line on stderr says the cap was reached, the
+output is partial, and the request should be narrowed. A resource's `timeout` (SPEC.md §8) ends the
+same way, the line saying it timed out. Memory stays flat whatever the result size, and waiting
+results cost disk, not RAM.
 
 When the channel ends, the broker marks the guest offline and applies the rules in SPEC.md §6:
 requests that have not started become `dropped` (exit 249 on `retrieve`); requests that are
@@ -260,9 +262,9 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
   nothing installed (pex's scie output or PyInstaller embed the interpreter) is a packaging option
   to evaluate when priviledge is distributed.
 - Standard library only at runtime: `socket`, `selectors`, `subprocess`, `json`, `base64`,
-  `argparse`, `tomllib`, `hashlib`, `shlex`, `tempfile`, `pwd`, `secrets`. No third-party runtime
-  dependencies. The inline prompt shows content escaped, not reformatted (SPEC.md §7); anything
-  richer is the external pager or editor.
+  `argparse`, `tomllib`, `hashlib`, `shlex`, `tempfile`, `termios`, `pwd`, `secrets`. No
+  third-party runtime dependencies. The inline prompt shows content escaped, not reformatted
+  (SPEC.md §7); anything richer is the external pager or editor.
 - **Rust is a deliberate later option, not now.** priviledge's untrusted input is JSON over the
   channel, mostly passed through to subprocesses; the security-critical logic is process and
   permission handling, not parsing. The stdlib `json` scanner (and `base64`'s) is C, the one
@@ -290,10 +292,9 @@ ships (SPEC.md §10).
    *inside* the real boundary surfaces the true frictions instead of guessing them.
 2. **Core loop, minimal:** `serve` with configuration resolution, the channel and relay, one
    resource, `request`/`wait`/`retrieve` and the prompt with both confirmations, with requests
-   running concurrently up to each resource's `concurrency`.
-   Against a local dev database, with the Postgres example resource of SETUP.md §9 built and
-   tested here. The channel parser and schema checks are fuzzed with malformed and adversarial
-   input from this iteration on.
+   running concurrently up to each resource's `concurrency`. Against a local dev database, with
+   the Postgres example resource of SETUP.md §9 built and tested here. The channel parser and
+   schema checks are fuzzed with malformed and adversarial input from this iteration on.
 3. **Core loop, complete:** `list`, `describe`, `pending`, `cancel`, output review with the
    external pager and editor, timeouts and the running view, the audit log, a read-only cloud
    resource.
