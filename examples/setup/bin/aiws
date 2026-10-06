@@ -8,13 +8,52 @@
 #   aiws reload <profile> <name>                reload its proxy, after editing its allow-list
 #   aiws verify <profile> <name> [allowed-url]  check it against SETUP.md §15
 #   aiws build                                  build the guest image in each VM that is running
+#   aiws vm start|stop|delete <vm>              create or start a VM (aiws, aiws-hostile) with its
+#                                               mounts; stop it; delete it with all its data
 # Profiles are the ones in priviledge's configuration (SPEC.md §8). Here each one is a container
 # shape: which VM it runs in, what is mounted, and how it reaches the network.
 set -eu
 
-usage() { sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 die() { echo "aiws: $*" >&2; exit 1; }
 vms="aiws aiws-hostile"
+egress_dir="$HOME/.aiws/egress"
+
+# The VMs (SETUP.md §2). This is their one definition: what each mounts from the host, read-only
+# unless marked :w, and nothing else. The dotfiles by their real path, which is what guests mount.
+vm_start() {
+  vm=$1; exchange_root="$HOME/aiws-exchange/$vm"
+  case $vm in
+    aiws)
+      dotfiles=$(cd "$HOME/.aiws/dotfiles" 2>/dev/null && pwd -P) || die "missing ~/.aiws/dotfiles"
+      set -- --cpus 4 --memory 8 --mount "$exchange_root:w" --mount "$egress_dir" --mount "$dotfiles" ;;
+    aiws-hostile)
+      set -- --cpus 2 --memory 2 --mount "$exchange_root:w" --mount "$egress_dir" ;;
+  esac
+  if docker --context "colima-$vm" info >/dev/null 2>&1; then
+    echo "aiws: $vm is running; to change its mounts: aiws vm stop $vm, then start it again"
+  else
+    mkdir -p "$exchange_root"
+    # --activate=false: the machine's default Docker context stays what it was.
+    colima start --profile "$vm" --activate=false "$@"
+  fi
+  docker --context "colima-$vm" image inspect aiws-base >/dev/null 2>&1 \
+    || docker --context "colima-$vm" build -t aiws-base "$HOME/.aiws"
+}
+
+if [ "${1:-}" = vm ]; then
+  [ $# -eq 3 ] || usage
+  case " $vms " in *" $3 "*) ;; *) die "unknown VM $3 (VMs: $vms)" ;; esac  # never another colima VM
+  case $2 in
+    start)  vm_start "$3" ;;
+    stop)   colima stop --profile "$3" ;;
+    # --data: otherwise the VM's Docker data (images, guests' home volumes) stays on disk, and a
+    # VM created later with the same name gets it back.
+    delete) colima delete --data --profile "$3" ;;
+    *)      usage ;;
+  esac
+  exit
+fi
 
 if [ "${1:-}" = build ]; then
   for vm in $vms; do
@@ -34,7 +73,6 @@ esac
 bin=$(cd "$(dirname "$0")" && pwd)
 guest="aiws-$profile-$name"        # the container; also the prefix of its network and sidecars
 home_volume="$guest-home"
-egress_dir="$HOME/.aiws/egress"
 
 # The VM the guest runs in (SETUP.md §2): hostile guests never share one with the others.
 case $profile in
@@ -43,6 +81,7 @@ case $profile in
   *) echo "aiws: unknown profile $profile" >&2; exit 64 ;;
 esac
 export DOCKER_CONTEXT="colima-$vm"
+docker info >/dev/null 2>&1 || die "VM $vm isn't running; start it with: aiws vm start $vm"
 exchange_dir="$HOME/aiws-exchange/$vm/$guest"
 
 # The egress proxy (SETUP.md §5): on the guest's internal network and on the bridge, the guest's

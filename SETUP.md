@@ -63,16 +63,18 @@ clean clone at a reviewed commit (§11), never a guest's working copy.
 ## 2. Runtime: dedicated colima VMs
 
 [colima](https://github.com/abiosoft/colima) runs Docker Engine in a [Lima](https://lima-vm.io)
-VM; both are open source. The setup gives guests two VMs of their own, created once:
+VM; both are open source. The setup gives guests two VMs of their own, `aiws` for `trusted` and
+`public` guests and `aiws-hostile` for `hostile-*` ones. `aiws` holds their one definition:
 
 ```sh
-mkdir -p ~/aiws-exchange/aiws ~/aiws-exchange/aiws-hostile
-colima start --profile aiws --activate=false --cpus 4 --memory 8 \
-  --mount ~/aiws-exchange/aiws:w --mount ~/.aiws/egress --mount "$(cd ~/.aiws/dotfiles && pwd -P)"
-colima start --profile aiws-hostile --activate=false --cpus 2 --memory 2 \
-  --mount ~/aiws-exchange/aiws-hostile:w --mount ~/.aiws/egress
-aiws build          # the guest image, in each VM: they don't share images
+aiws vm start aiws            # create it, or start it; then build the guest image if it lacks it
+aiws vm start aiws-hostile    # when a hostile task needs it
 ```
+
+`aiws vm start` runs `colima start` with the VM's full list of mounts: for `aiws`, its exchange
+root (`~/aiws-exchange/aiws`, writable), `~/.aiws/egress` and the dotfiles' real path; for
+`aiws-hostile`, its own exchange root and `~/.aiws/egress`. Any other `aiws` command whose VM
+isn't running stops and names the command that starts it.
 
 - **Why dedicated VMs.** A guest that escapes its container (a kernel or runtime flaw, SPEC.md §3)
   lands in the VM and reaches whatever the VM can see. A general-purpose runtime's VM usually
@@ -86,12 +88,20 @@ aiws build          # the guest image, in each VM: they don't share images
   write to a read-only mount, nor after remounting it read-write, nor after mounting the share
   again by its tag. So an escape reaches the exchange directories (writable by guests anyway),
   and can read the dotfiles and egress configuration, which hold nothing secret.
-- **`--activate=false`** keeps colima from making the VM the Docker CLI's default context. The
-  scripts select a VM explicitly (`docker --context colima-aiws`), and every other `docker`
+- **`--activate=false`**, which `aiws vm start` passes and the VM's profile remembers, keeps
+  colima from making the VM the Docker CLI's default context. The scripts select a VM explicitly (`docker --context colima-aiws`), and every other `docker`
   command on the machine keeps going where it went before.
 - **Changing mounts** (adding the clean clones that a project's compose file bind-mounts, §12):
-  `colima stop --profile aiws`, then `colima start` with the full new list of `--mount`s. The list
-  is stored in the profile; after a reboot `colima start --profile aiws` is enough.
+  edit the list in `aiws`, then `aiws vm stop aiws` and `aiws vm start aiws`. colima stores the
+  list in the VM's profile, so a running VM keeps the one it started with.
+- **Lifecycle.** VMs don't start by themselves after a reboot: `aiws vm start <vm>`. A VM's
+  configuration is in `~/.colima/<vm>/`, its Docker data (images, and every guest's home volume:
+  repos, the agent's login) in a sparse disk under `~/.colima/_lima/_disks/`, and the downloaded
+  VM image in `~/Library/Caches/colima`. `aiws vm stop` frees the VM's memory and keeps
+  everything; `aiws vm delete` removes it after two confirmations, with `--data`: a plain `colima
+  delete` keeps the data disk, and a VM created later with the same name gets it back, guests'
+  volumes included (checked on colima 0.10.3). `aiws-hostile` is meant to be disposable: start it
+  for a hostile task, delete it when its guests are gone.
 - Port forwarding: colima forwards ports the VM listens on to the host. Everything this setup
   publishes binds `127.0.0.1`, which lands on the host's loopback only (§13).
 - **Never** give a guest the runtime's control socket (`/var/run/docker.sock` or equivalent),
@@ -131,6 +141,8 @@ aiws port   <profile> <name> <port>[:<guest-port>]
 aiws reload <profile> <name>                reload its proxy, after editing its allow-list
 aiws verify <profile> <name> [allowed-url]  check it against §15
 aiws build                                  build the guest image in each VM that is running
+aiws vm start|stop|delete <vm>              create or start a VM (aiws, aiws-hostile) with its
+                                            mounts; stop it; delete it with all its data
 ```
 
 `aiws new` picks the VM from the profile, creates the home volume and the exchange directory,
@@ -234,7 +246,8 @@ Notes:
 
 `~/.aiws/Dockerfile` builds `aiws-base`: Debian stable with the shared tooling (git, curl, ripgrep,
 fd, zsh, a compiler toolchain, the Postgres client), a UTF-8 locale, a pinned nvim release, and a
-non-root user, `aiws`. `aiws build` builds it in each running VM, since VMs don't share images.
+non-root user, `aiws`. `aiws vm start` builds it in a VM that lacks it, and `aiws build` rebuilds
+it in each running VM after a change: VMs don't share images.
 The build runs in the VM's Docker Engine, outside any guest and its proxy, so the downloads it
 makes (Debian packages, the nvim release from GitHub) never need to be in a guest's allow-list.
 
