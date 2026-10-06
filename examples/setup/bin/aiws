@@ -1,0 +1,135 @@
+#!/bin/sh
+# ~/.aiws/bin/aiws: create, remove and enter guests (SETUP.md §4).
+#   aiws new    <profile> <name>                create the guest aiws-<profile>-<name>
+#   aiws rm     <profile> <name>                remove it, with its network, sidecars and home volume
+#   aiws exec   <profile> <name> [cmd...]       run a command in it (default: a shell)
+#   aiws port   <profile> <name> <port>[:<guest-port>]
+#                                               forward 127.0.0.1:<port> on the host to the guest
+#   aiws reload <profile> <name>                reload its proxy, after editing its allow-list
+#   aiws verify <profile> <name> [allowed-url]  check it against SETUP.md §15
+#   aiws build                                  build the guest image in each VM that is running
+# Profiles are the ones in priviledge's configuration (SPEC.md §8). Here each one is a container
+# shape: which VM it runs in, what is mounted, and how it reaches the network.
+set -eu
+
+usage() { sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+die() { echo "aiws: $*" >&2; exit 1; }
+vms="aiws aiws-hostile"
+
+if [ "${1:-}" = build ]; then
+  for vm in $vms; do
+    docker --context "colima-$vm" info >/dev/null 2>&1 || continue
+    echo "aiws: building aiws-base in $vm"
+    docker --context "colima-$vm" build -t aiws-base "$HOME/.aiws"
+  done
+  exit
+fi
+
+[ $# -ge 3 ] || usage
+command=$1; profile=$2; name=$3
+shift 3
+case $name in
+  *-*) echo "aiws: guest names can't contain '-' (this helper's naming needs it)" >&2; exit 64 ;;
+esac
+bin=$(cd "$(dirname "$0")" && pwd)
+guest="aiws-$profile-$name"        # the container; also the prefix of its network and sidecars
+home_volume="$guest-home"
+egress_dir="$HOME/.aiws/egress"
+
+# The VM the guest runs in (SETUP.md §2): hostile guests never share one with the others.
+case $profile in
+  trusted|public)             vm=aiws ;;
+  hostile-web|hostile-sample) vm=aiws-hostile ;;
+  *) echo "aiws: unknown profile $profile" >&2; exit 64 ;;
+esac
+export DOCKER_CONTEXT="colima-$vm"
+exchange_dir="$HOME/aiws-exchange/$vm/$guest"
+
+# The egress proxy (SETUP.md §5): on the guest's internal network and on the bridge, the guest's
+# only way out. Its configuration is read from the VM's read-only mount of ~/.aiws/egress.
+start_proxy() {
+  mode=$1; list=
+  if [ "$mode" = allowlist ]; then
+    f="$egress_dir/$guest.txt"     # must exist: Docker would create a directory in its place
+    [ -f "$f" ] || die "missing allow-list $f"
+    list="-v $f:/etc/squid/allow.txt:ro"
+  fi
+  # shellcheck disable=SC2086 # $list is an option, or nothing
+  docker run -d --name "$guest-proxy" --network bridge $list \
+    -v "$egress_dir/squid-$mode.conf:/etc/squid/squid.conf:ro" \
+    ubuntu/squid >/dev/null
+  docker network connect --alias "$guest-proxy" "$guest" "$guest-proxy"
+}
+
+new_guest() {
+  # 1. What the profile decides: the mounts, and the egress mode.
+  mounts="-v $home_volume:/home/aiws -v $exchange_dir:/home/aiws/exchange"
+  case $profile in
+    trusted|public)
+      # The real path: the VM mounts it, not a link to it (SETUP.md §2).
+      dotfiles=$(cd "$HOME/.aiws/dotfiles" 2>/dev/null && pwd -P) || die "missing ~/.aiws/dotfiles"
+      mounts="$mounts -v $dotfiles:/home/aiws/.dotfiles:ro"; egress=allowlist ;;
+    hostile-web)    egress=public ;;
+    hostile-sample) egress=none ;;
+  esac
+
+  # 2. Storage: the home volume and the per-guest exchange directory.
+  docker volume create "$home_volume" >/dev/null
+  mkdir -p "$exchange_dir"
+
+  # 3. Network: none at all, or an internal network whose only way out is the proxy.
+  if [ "$egress" = none ]; then
+    network="--network none"
+  else
+    docker network create --internal "$guest" >/dev/null
+    start_proxy "$egress"
+    proxy="http://$guest-proxy:3128"
+    no_proxy="localhost,127.0.0.1${AIWS_NO_PROXY:+,$AIWS_NO_PROXY}"  # HTTP dev services, §12
+    network="--network $guest \
+      -e http_proxy=$proxy -e https_proxy=$proxy -e HTTP_PROXY=$proxy -e HTTPS_PROXY=$proxy \
+      -e no_proxy=$no_proxy -e NO_PROXY=$no_proxy"
+  fi
+
+  # 4. The guest: no capabilities, no privilege escalation, idle until something execs into it.
+  # shellcheck disable=SC2086 # $network and $mounts are lists of options
+  docker run -d --name "$guest" --hostname "$guest" --init \
+    --cap-drop ALL --security-opt no-new-privileges:true \
+    -e TERM=xterm-256color $network $mounts \
+    aiws-base sleep infinity >/dev/null
+}
+
+# A forwarder for one port, on the bridge (Docker publishes no ports of a container that is only
+# on an internal network) and attached to the guest's network. colima forwards the published port
+# to the host's 127.0.0.1.
+forward_port() {
+  [ -n "${1:-}" ] || usage
+  host_port=${1%%:*}; guest_port=${1#*:}
+  forwarder="$guest-port-$host_port"
+  ! docker inspect "$forwarder" >/dev/null 2>&1 || die "port $host_port is already forwarded"
+  docker run -d --name "$forwarder" --network bridge -p "127.0.0.1:$host_port:$guest_port" \
+    alpine/socat "TCP-LISTEN:$guest_port,fork,reuseaddr" "TCP:$guest:$guest_port" >/dev/null \
+    || { docker rm -f "$forwarder" >/dev/null 2>&1; die "can't forward port $host_port"; }
+  docker network connect "$guest" "$forwarder"
+}
+
+remove_guest() {
+  docker ps -a --format '{{.Names}}' | grep -E "^$guest(-proxy|-port-[0-9]+)?\$" \
+    | xargs docker rm -f -v >/dev/null 2>&1 || true  # -v: also the images' anonymous volumes
+  docker network rm "$guest" >/dev/null 2>&1 || true
+  docker volume rm "$home_volume"
+}
+
+enter_guest() {
+  [ $# -gt 0 ] || set -- zsh
+  exec docker exec -it -w /home/aiws/src "$guest" "$@"
+}
+
+case $command in
+  new)    new_guest ;;
+  rm)     remove_guest ;;
+  exec)   enter_guest "$@" ;;
+  port)   forward_port "$@" ;;
+  reload) docker exec "$guest-proxy" squid -k reconfigure ;;
+  verify) exec "$bin/aiws-verify" "$profile" "$name" "$@" ;;
+  *)      usage ;;
+esac

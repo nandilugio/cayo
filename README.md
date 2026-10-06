@@ -32,6 +32,7 @@ documents:
 
 - [SPEC.md](SPEC.md): what priviledge is and does, and its security model.
 - [DESIGN.md](DESIGN.md): how it is built.
-- [SETUP.md](SETUP.md): a reference deployment around it.
+- [SETUP.md](SETUP.md): a reference deployment around it, with its files in
+  [examples/setup/](examples/setup/).
 
 Licensed under the [MIT License](LICENSE).

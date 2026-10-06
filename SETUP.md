@@ -1,11 +1,11 @@
 # priviledge — reference setup (draft)
 
 Status: draft. This describes **one** way to deploy the AI workspace around priviledge: Docker
-containers on macOS. priviledge itself does not depend on it; it only needs the deployment contract
-in [SPEC.md §4](SPEC.md#4-deployment-contract); how priviledge reaches a guest is in
-[DESIGN.md §3](DESIGN.md#3-channel-and-relay). Other setups are sketched in §14. Items marked
-**(verify)** must be checked on the real machine. Every command here changes the machine's
-configuration, so the human reviews and runs it.
+containers in dedicated colima VMs on macOS. priviledge itself does not depend on it; it only
+needs the deployment contract in [SPEC.md §4](SPEC.md#4-deployment-contract); how priviledge
+reaches a guest is in [DESIGN.md §3](DESIGN.md#3-channel-and-relay). Other setups are sketched in
+§14. Items marked **(verify)** must be checked on the real machine. Every command here changes
+the machine's configuration, so the human reviews and runs it.
 
 Terms (guest, profile, privileged side, broker) are as defined in
 [SPEC.md §3](SPEC.md#3-threat-model).
@@ -13,170 +13,131 @@ Terms (guest, profile, privileged side, broker) are as defined in
 ## 1. Overview
 
 ```
-host: privileged side                         Docker VM
+host: privileged side                         colima VM aiws (trusted, public guests)
 ┌─────────────────────────────────────────┐   ┌──────────────────────────────────┐
 │ terminal + tmux                         │   │ guest aiws-trusted-shop          │
-│   panes: docker exec -it … aiws-…       │──▶│   nvim + LSP, agent, tests,      │
+│   panes: aiws exec … (docker exec -it)  │──▶│   nvim + LSP, agent, tests,      │
 │   pane:  priviledge serve trusted shop  │──▶│   dev servers, priviledge relay  │
 │ secrets, priviledge config              │   │   repos in a volume              │
-│ clean clones (review, push, deploy)     │   │   dotfiles mounted read-only     │
-│ docker CLI (runtime control)            │   ├──────────────────────────────────┤
-│ browser                                 │   │ egress proxy, port forwarder     │
-└─────────────────────────────────────────┘   │ dev services (project compose)   │
-                                              └──────────────────────────────────┘
+│ the setup's files (~/.aiws)             │   │   dotfiles mounted read-only     │
+│ clean clones (review, push, deploy)     │   ├──────────────────────────────────┤
+│ docker CLI, colima (runtime control)    │   │ egress proxy, port forwarders    │
+│ browser                                 │   │ dev services (project compose)   │
+└─────────────────────────────────────────┘   └──────────────────────────────────┘
+                                              colima VM aiws-hostile (hostile-* guests)
 ```
 
 - A **guest** is a container created on demand from a **profile** (SPEC.md §3): the profile decides
-  the image, what is mounted, and the egress policy. `aiws new trusted shop` creates
+  the VM it runs in, what is mounted, and the egress policy. `aiws new trusted shop` creates
   `aiws-trusted-shop`; `priviledge serve trusted shop` brokers for it.
 - One guest per project and profile, i.e. per trust domain. Many sessions (nvim, several agents,
   shells) run inside the same guest.
-- On macOS, all containers run inside the runtime's Linux VM, so the host is behind a VM boundary.
-  Guests are separated from each other by kernel namespaces inside that VM, which is weaker but
-  adequate for project-vs-project trust. It is not adequate for `hostile-sample` guests, which run
-  exploit material next to the trusted guests' kernel: those need a separate VM (§14). The same is
-  advisable for `hostile-web`, where a hostile page would have to chain a browser exploit and a
-  kernel exploit to get that far.
+- Guests run in **VMs of their own** (§2), not in the machine's general container runtime, so the
+  host is behind a VM boundary whose exposure the setup decides: the VMs see only the few host
+  paths they mount, read-only except the exchange directories. Inside a VM, guests are separated
+  from each other by kernel namespaces, which is weaker but adequate for project-vs-project trust.
+  It is not adequate next to hostile material, so `hostile-*` guests run in a second VM,
+  `aiws-hostile`, apart from the `trusted` and `public` ones.
 - The privileged side drives guests only through the runtime's CLI, and never runs code written in
   a guest except reviewed code at a pinned commit (§11, §12).
 
-**Files.** The scripts and configuration in this document are an example, not part of
-priviledge. Copy them to `~/.aiws` and make them yours: from then on they don't follow the
-repository, and nothing here is supported beyond being an example. priviledge's own files live in
-`~/.priviledge` (SPEC.md §8), separate because only those matter to the broker; another
-deployment has no `~/.aiws` at all. Copy from a checkout you trust; for priviledge's own
-development that means a clean clone at a reviewed commit (§11), never a guest's working copy.
+**Files.** The scripts and configuration of this setup are in the repository's
+`examples/setup/`, tested as described in §15. They are an example, not part of priviledge: copy
+the directory to `~/.aiws` and make it yours. From then on it doesn't follow the repository, and
+nothing here is supported beyond being an example. priviledge's own files live in `~/.priviledge`
+(SPEC.md §8), separate because only those matter to the broker; another deployment has no
+`~/.aiws` at all. Copy from a checkout you trust; for priviledge's own development that means a
+clean clone at a reviewed commit (§11), never a guest's working copy.
 
 ```
 ~/.aiws/
-├── bin/          aiws, aiws-egress, aiws-port, aiws-window (on PATH)
-├── Dockerfile
-├── egress/       squid-allowlist.conf, squid-public.conf, <guest>.txt allow-lists
-├── dotfiles/     mounted read-only into trusted and public guests
+├── bin/          aiws (guests), aiws-verify (§15), aiws-window (§7): on PATH
+├── Dockerfile    the guest image (§6)
+├── egress/       squid-allowlist.conf, squid-public.conf, <guest>.txt allow-lists (§5)
+├── dotfiles/     mounted read-only into trusted and public guests; may be a link (§4)
 ├── overrides/    compose overrides per project (§12)
 └── run/          dtach sockets of the approval panes (§7)
-~/aiws-exchange/<guest>/   exchange directories: guest-written, so kept out of ~/.aiws
+~/aiws-exchange/<vm>/<guest>/   exchange directories: guest-written, so kept out of ~/.aiws
 ```
 
-## 2. Container runtime
+## 2. Runtime: dedicated colima VMs
 
-Any runtime with a Docker-compatible CLI works: Docker Desktop, colima, Podman. priviledge only
-needs `exec -i`.
+[colima](https://github.com/abiosoft/colima) runs Docker Engine in a [Lima](https://lima-vm.io)
+VM; both are open source. The setup gives guests two VMs of their own, created once:
 
-- **Licensing:** Docker Desktop's licence depends on your situation; colima and Podman are free.
-- **File sharing:** restrict the runtime's shared host paths to what containers actually mount:
-  the dotfiles, egress configuration and exchange directories (§4, §5), and the clean-clone paths
-  that project compose files bind-mount (§12). Not all of `/Users`. If a guest escaped into the
-  runtime's VM, it would reach whatever the VM can see, including those clean clones.
-  **(verify)** that Docker Desktop allows removing the default paths.
+```sh
+mkdir -p ~/aiws-exchange/aiws ~/aiws-exchange/aiws-hostile
+colima start --profile aiws --activate=false --cpus 4 --memory 8 \
+  --mount ~/aiws-exchange/aiws:w --mount ~/.aiws/egress --mount "$(cd ~/.aiws/dotfiles && pwd -P)"
+colima start --profile aiws-hostile --activate=false --cpus 2 --memory 2 \
+  --mount ~/aiws-exchange/aiws-hostile:w --mount ~/.aiws/egress
+aiws build          # the guest image, in each VM: they don't share images
+```
+
+- **Why dedicated VMs.** A guest that escapes its container (a kernel or runtime flaw, SPEC.md §3)
+  lands in the VM and reaches whatever the VM can see. A general-purpose runtime's VM usually
+  sees the whole home directory (Docker Desktop shares `/Users` by default), and restricting it is
+  a machine-wide setting other tools depend on. These VMs belong to the setup, which decides what
+  they mount, independently of any other container work on the machine.
+- **What a VM sees of the host:** exactly its `--mount`s, at the same paths, and nothing else
+  (`/Users` in the VM holds only the path down to them). Mounts are read-only unless marked
+  `:w`, and with colima's defaults on macOS (the `vz` VM type, virtiofs mounts) **the host
+  enforces read-only**: checked on colima 0.10.3 (Lima 2.2.1), root inside the VM could neither
+  write to a read-only mount, nor after remounting it read-write, nor after mounting the share
+  again by its tag. So an escape reaches the exchange directories (writable by guests anyway),
+  and can read the dotfiles and egress configuration, which hold nothing secret.
+- **`--activate=false`** keeps colima from making the VM the Docker CLI's default context. The
+  scripts select a VM explicitly (`docker --context colima-aiws`), and every other `docker`
+  command on the machine keeps going where it went before.
+- **Changing mounts** (adding the clean clones that a project's compose file bind-mounts, §12):
+  `colima stop --profile aiws`, then `colima start` with the full new list of `--mount`s. The list
+  is stored in the profile; after a reboot `colima start --profile aiws` is enough.
+- Port forwarding: colima forwards ports the VM listens on to the host. Everything this setup
+  publishes binds `127.0.0.1`, which lands on the host's loopback only (§13).
 - **Never** give a guest the runtime's control socket (`/var/run/docker.sock` or equivalent),
-  `privileged: true`, host networking, or the host PID namespace. Any of these hands the guest the
-  privileged side.
+  `privileged: true`, host networking, or the host PID namespace. Any of these hands the guest
+  its VM, and with it everything the VM mounts.
 
 ## 3. Profiles
 
 Each profile in priviledge's configuration (SPEC.md §8) is implemented here as a guest shape. The
 reference set:
 
-| Profile | Image | Mounted | Native tokens | Egress (§5) |
+| Profile | VM | Mounted | Native tokens | Egress (§5) |
 |---|---|---|---|---|
-| `trusted` | `aiws-base` | home volume, dotfiles (ro), exchange | git read-only token | proxy, allow-list |
-| `public` | `aiws-base` | same | none (public repos clone anonymously) | proxy, allow-list |
-| `hostile-web` | `aiws-base` | fresh home volume, exchange only | none | proxy, public internet only |
-| `hostile-sample` | `aiws-base` | fresh home volume, exchange only | none | none (`--network none`) |
+| `trusted` | `aiws` | home volume, dotfiles (ro), exchange | git read-only token | proxy, allow-list |
+| `public` | `aiws` | same | none (public repos clone anonymously) | proxy, allow-list |
+| `hostile-web` | `aiws-hostile` | fresh home volume, exchange only | none | proxy, public internet only |
+| `hostile-sample` | `aiws-hostile` | fresh home volume, exchange only | none | none (`--network none`) |
 
-`hostile-*` guests are meant to be disposable: created for the task, removed after (`aiws rm`).
-No broker runs for them; results leave through the exchange directory, carried by the human.
+All run the same image, `aiws-base` (§6). `hostile-*` guests are meant to be disposable: created
+for the task, removed after (`aiws rm`). No broker runs for them; results leave through the
+exchange directory, carried by the human.
 
 Every guest that runs an agent also holds the agent's own login or key (§10), a known issue in
 SPEC.md §3.
 
 ## 4. Guests
 
-A guest is created by a small privileged-owned helper. Nothing about a guest's shape is decided
-inside it.
+A guest is created by a small privileged-owned helper, `~/.aiws/bin/aiws`. Nothing about a
+guest's shape is decided inside it.
 
-```sh
-#!/bin/sh
-# ~/.aiws/bin/aiws: create, remove and enter guests.
-#   aiws new  <profile> <name>            create the guest aiws-<profile>-<name>
-#   aiws rm   <profile> <name>            remove it, with its network, sidecars and home volume
-#   aiws exec <profile> <name> [cmd...]   run a command in it (default: a shell)
-# Profiles are the ones in priviledge's configuration (SPEC.md §8). Here each one is a container
-# shape: what is mounted, and how the guest reaches the network.
-set -e
-
-usage() { echo "usage: aiws new|rm|exec <profile> <name> [cmd...]" >&2; exit 64; }
-
-command=${1:-}; profile=${2:-}; name=${3:-}
-[ -n "$profile" ] && [ -n "$name" ] || usage
-shift 3
-case $name in
-  *-*) echo "aiws: guest names can't contain '-' (this helper's naming needs it)" >&2; exit 64 ;;
-esac
-guest="aiws-$profile-$name"        # the container; also the prefix of its network and sidecars
-home_volume="$guest-home"
-exchange_dir="$HOME/aiws-exchange/$guest"
-dotfiles_dir="$HOME/.aiws/dotfiles"
-
-new_guest() {
-  # 1. What the profile decides: the mounts, and the egress mode (§5).
-  mounts="-v $home_volume:/home/aiws -v $exchange_dir:/home/aiws/exchange"
-  case $profile in
-    trusted|public) mounts="$mounts -v $dotfiles_dir:/home/aiws/.dotfiles:ro"; egress=allowlist ;;
-    hostile-web)    egress=public ;;
-    hostile-sample) egress=none ;;
-    *) echo "aiws: unknown profile $profile" >&2; exit 64 ;;
-  esac
-
-  # 2. Storage: the home volume and the per-guest exchange directory.
-  docker volume create "$home_volume" >/dev/null
-  mkdir -p "$exchange_dir"
-
-  # 3. Network: none at all, or an internal network whose only way out is the proxy sidecar.
-  if [ "$egress" = none ]; then
-    network="--network none"
-  else
-    docker network create --internal "$guest" >/dev/null
-    aiws-egress "$guest" "$egress"                                   # the proxy sidecar, §5
-    proxy="http://$guest-proxy:3128"
-    no_proxy="localhost,127.0.0.1${AIWS_NO_PROXY:+,$AIWS_NO_PROXY}"  # HTTP dev services, §12
-    network="--network $guest \
-      -e http_proxy=$proxy -e https_proxy=$proxy -e HTTP_PROXY=$proxy -e HTTPS_PROXY=$proxy \
-      -e no_proxy=$no_proxy -e NO_PROXY=$no_proxy"
-  fi
-
-  # 4. The guest: no capabilities, no privilege escalation, idle until something execs into it.
-  docker run -d --name "$guest" --hostname "$guest" --init \
-    --cap-drop ALL --security-opt no-new-privileges:true \
-    -e TERM=xterm-256color $network $mounts \
-    aiws-base sleep infinity >/dev/null
-
-  # 5. A forwarder for the dev server's port, for guests that have a network (below).
-  [ "$egress" = none ] || aiws-port "$guest" "${AIWS_PORT:-8000}"
-}
-
-remove_guest() {
-  docker rm -f "$guest" "$guest-proxy" "$guest-port" >/dev/null 2>&1 || true
-  docker network rm "$guest" >/dev/null 2>&1 || true
-  docker volume rm "$home_volume"
-}
-
-enter_guest() {
-  [ $# -gt 0 ] || set -- zsh
-  exec docker exec -it -w /home/aiws/src "$guest" "$@"
-}
-
-case $command in
-  new)  new_guest ;;
-  rm)   remove_guest ;;
-  exec) enter_guest "$@" ;;
-  *)    usage ;;
-esac
+```
+aiws new    <profile> <name>                create the guest aiws-<profile>-<name>
+aiws rm     <profile> <name>                remove it, with its network, sidecars and home volume
+aiws exec   <profile> <name> [cmd...]       run a command in it (default: a shell)
+aiws port   <profile> <name> <port>[:<guest-port>]
+                                            forward 127.0.0.1:<port> on the host to the guest
+aiws reload <profile> <name>                reload its proxy, after editing its allow-list
+aiws verify <profile> <name> [allowed-url]  check it against §15
+aiws build                                  build the guest image in each VM that is running
 ```
 
-priviledge accepts `-` in guest names (DESIGN.md §2); this helper doesn't, because it names a
-guest's network, volume and sidecars by appending to the container's name: a guest named
+`aiws new` picks the VM from the profile, creates the home volume and the exchange directory,
+for a guest with a network an internal network and its proxy (§5), and runs the container with
+no capabilities, no privilege escalation, and nothing but `sleep` until something execs into it.
+Guest names can't contain `-`, although priviledge accepts it (DESIGN.md §2): the helper names a
+guest's network, volume and sidecars by appending to the container's name, and a guest named
 `shop-proxy` would collide with the proxy of a guest named `shop`.
 
 The guest's home, as the guest sees it:
@@ -186,45 +147,40 @@ The guest's home, as the guest sees it:
 ├── src/                        repos, cloned from inside
 ├── .dotfiles/                  bind mount, read-only  ◀─ ~/.aiws/dotfiles on the host
 ├── .config/nvim → .dotfiles/nvim   links made once, inside
-└── exchange/                   bind mount, writable   ◀─ ~/aiws-exchange/<guest> on the host
+└── exchange/                   bind mount, writable   ◀─ ~/aiws-exchange/<vm>/<guest> on the host
 ```
 
 - **Repos live in the guest's home volume**, not on the host filesystem. The volume survives the
   container, so the guest can be recreated from a new image without losing anything; it lives
-  inside the runtime's VM, so it is fast where bind mounts from macOS are slow; and the privileged
-  side can't accidentally run git or an editor against the repos, since it reaches them only
-  through the `ext::` remote (§11).
+  inside the VM, so it is fast where mounts from the host are slow; and the privileged side can't
+  accidentally run git or an editor against the repos, since it reaches them only through the
+  `ext::` remote (§11).
 - **Dotfiles are mounted read-only**: nvim config, shell config, git config (no credentials), the
-  global gitignore, the agent's global instructions. Change them once on the host and every guest
-  sees it. Inside the guest, link them into place once (`ln -s ~/.dotfiles/nvim ~/.config/nvim`).
-  They must never contain secrets. `hostile-*` guests get no dotfiles: less to configure, and
-  nothing of the human's in them.
+  global gitignore, the agent's global instructions. Change them on the host and every guest sees
+  it at once. Inside the guest, link them into place once (`ln -s ~/.dotfiles/nvim
+  ~/.config/nvim`). `~/.aiws/dotfiles` may be a link to an existing dotfiles checkout: `aiws`
+  mounts its real path, which is what the VM mounts too (§2). They must never contain secrets,
+  and file modes don't help: a guest reads every file in a mount, whatever its permissions.
+  `hostile-*` guests get no dotfiles: less to configure, and nothing of the human's in them.
 - **The exchange directory** is the one writable host path, for screenshots, CSVs and similar.
-  It is per guest (`~/aiws-exchange/<guest>`), so guests of different profiles never share one.
-  On the host, treat its contents like untrusted downloads. The guest can also create symlinks
-  there that point at host paths: a host tool that follows one reads or overwrites the host file.
-  Don't write into the directory over existing names, and check with `ls -l` before opening
-  what's there.
+  It is per guest, under its VM's exchange root, so guests of different profiles never share one
+  and the hostile VM can't see the others' at all. On the host, treat its contents like untrusted
+  downloads. The guest can also create symlinks there that point at host paths: a host tool that
+  follows one reads or overwrites the host file. Don't write into the directory over existing
+  names, and check with `ls -l` before opening what's there.
 - **Proxy variables** are set in both spellings, because tools disagree on which they read (curl,
   for one, ignores an uppercase `HTTP_PROXY`). `AIWS_NO_PROXY` adds the project's HTTP dev services
   (§12), which would otherwise be sent to the proxy and refused.
-- **Published ports.** Docker does not publish ports for a container that is only on an internal
-  network, so a small forwarder does it (`aiws-port`, below): the host port, on `127.0.0.1`, is
-  chosen per guest (`AIWS_PORT`, default 8000) to avoid clashes, and always leads to port 8000 in
-  the guest, Django's default. Dev servers must listen on `0.0.0.0` *inside* the guest for the
-  forwarder to reach them (Django's, for one, defaults to `127.0.0.1`). Published ports are
-  reachable from other guests' networks through the host (§13), so they should not expose anything
-  that trusts its callers.
-
-```sh
-#!/bin/sh
-# ~/.aiws/bin/aiws-port: aiws-port <guest> <host-port>, forwarded to port 8000 in the guest.
-# Created on the bridge so its port can be published, then attached to the guest's network.
-g=$1; port=$2
-docker run -d --name "$g-port" --network bridge -p "127.0.0.1:$port:8000" \
-  alpine/socat "TCP-LISTEN:8000,fork,reuseaddr" "TCP:$g:8000" >/dev/null
-docker network connect "$g" "$g-port"
-```
+- **Ports, when a guest needs them.** Docker does not publish ports for a container that is only
+  on an internal network, so `aiws port` starts a small forwarder per port, on the bridge and
+  attached to the guest's network: `aiws port trusted shop 8000` makes the guest's port 8000
+  reachable at `127.0.0.1:8000` on the host, `aiws port trusted shop 18000:5173` maps a different
+  host port. Each guest and service needs its own host port: a clash within a VM is refused, but
+  one between the two VMs, or with a host process, goes unnoticed, and the host port then leads to
+  whichever claimed it first. Dev servers must listen on `0.0.0.0` *inside* the guest for the
+  forwarder to reach them (Django's, for one, defaults to `127.0.0.1`). Forwarded ports are
+  reachable from other containers in the VM through the host (§13), so they should not expose
+  anything that trusts its callers.
 
 ## 5. Egress
 
@@ -233,10 +189,9 @@ item 5). The mechanism for every guest with a network: **the network denies, the
 
 - The guest is on an `--internal` Docker network, which has no route out. Non-HTTP TCP, UDP and
   external DNS simply have nowhere to go; the internal network blocks them, not the proxy. The
-  guest resolves only local names; the proxy resolves the rest. Checked on Docker Desktop 29.8:
-  the embedded DNS answers SERVFAIL for external names on an internal network, so DNS queries
-  can't carry data out either.
-- A proxy sidecar is on that network *and* a normal one, and is the guest's only way out. The
+  guest resolves only local names; the proxy resolves the rest, so DNS queries can't carry data
+  out either.
+- A proxy sidecar is on that network *and* the bridge, and is the guest's only way out. The
   guest's proxy variables point at it. Honouring them is voluntary, but a process that ignores them
   has no route at all.
 - The proxy never connects to private, loopback or link-local addresses, which keeps the host,
@@ -246,95 +201,50 @@ item 5). The mechanism for every guest with a network: **the network denies, the
   (`hostile-web`) allows any public address. `hostile-sample` has no network at all.
 - No TLS interception: the proxy sees hostnames, not contents, and the guest needs no extra CA.
 
-```sh
-#!/bin/sh
-# ~/.aiws/bin/aiws-egress: aiws-egress <guest> allowlist|public
-g=$1; mode=$2; list=
-if [ "$mode" = allowlist ]; then
-  f=$HOME/.aiws/egress/$g.txt                  # must exist: Docker would create a directory
-  [ -f "$f" ] || { echo "missing allow-list $f" >&2; exit 1; }
-  list="-v $f:/etc/squid/allow.txt:ro"
-fi
-docker run -d --name "$g-proxy" --network bridge $list \
-  -v "$HOME/.aiws/egress/squid-$mode.conf:/etc/squid/squid.conf:ro" \
-  ubuntu/squid >/dev/null
-docker network connect --alias "$g-proxy" "$g" "$g-proxy"
-```
-
-```
-# ~/.aiws/egress/squid-allowlist.conf (the relevant part)
-acl private dst 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 127.0.0.0/8
-acl private dst 169.254.0.0/16 ::1 fc00::/7 fe80::/10
-acl allowed dstdomain "/etc/squid/allow.txt"
-acl SSL_ports port 443
-acl CONNECT method CONNECT
-http_access deny private
-http_access deny CONNECT !SSL_ports
-http_access allow allowed
-http_access deny all
-http_port 3128
-
-# ~/.aiws/egress/squid-public.conf: the same, without `allowed`, ending in
-http_access deny private
-http_access deny CONNECT !SSL_ports
-http_access allow all
-```
-
-```
-# ~/.aiws/egress/aiws-trusted-shop.txt
-.anthropic.com
-.githubusercontent.com
-pypi.org
-.pythonhosted.org
-.npmjs.org
-...
-```
+The proxy is Squid, configured by `~/.aiws/egress/squid-allowlist.conf` or `squid-public.conf`,
+and, in allow-list mode, by the guest's own list, `~/.aiws/egress/aiws-<profile>-<name>.txt`: one
+hostname per line, a leading dot for subdomains too, `#` for comments. The VMs mount the egress
+directory read-only (§2), so a list is edited on the host and applied with `aiws reload`; nothing
+in a guest or a VM can change it. A list may be empty: Squid warns about the empty ACL and
+refuses everything. `allow-list.example.txt` is a commented starting point.
 
 Notes:
 
-- Checked on Docker Desktop 29.8: a container on an `--internal` network cannot reach
-  `host.docker.internal` (the name doesn't resolve there) or the internet; it resolves and reaches
-  a sidecar that is on its network and the bridge; and a port published on that sidecar reaches
-  the guest from the host.
+- Checked on colima 0.10.3, with `aiws verify` (§15) and by hand: an internal network has no
+  route to the internet or to the host; a guest's lookups of external names fail without leaving
+  the VM (none showed up on any of its interfaces); the proxy refuses hosts off the list, the
+  host, and private addresses with its own 403; a port forwarded with `aiws port` reaches the
+  host's loopback.
 - Squid is the boring choice. iron-proxy is the alternative when credential injection is wanted
   (the guest holds a placeholder token, the proxy swaps in the real one at egress, so git's native
   token, SPEC.md §5, never enters the guest), at the cost of terminating TLS: every client in the
   guest must trust its CA.
-- Denied hosts are logged by the proxy; reviewing that log is how allow-lists grow. Approval of new
-  hosts through priviledge is in the backlog (SPEC.md §10).
-- An allowed host that stores data for any account can carry data out (SPEC.md §3), and in
-  `trusted` the list also decides what strangers' text the agent reads. Keep such hosts off it
-  where the work allows: `pypi.org` without the leading dot excludes `upload.pypi.org`, and pip
-  downloads from `files.pythonhosted.org`. Where one host serves both, as npm's registry does, and
-  for the agent's own model API, output review is the control.
+- Denied hosts are in the proxy's log (`docker --context colima-aiws exec
+  aiws-<profile>-<name>-proxy tail /var/log/squid/access.log`); reviewing it is how allow-lists
+  grow. Approval of new hosts through priviledge is in the backlog (SPEC.md §10).
+- Start lists as empty as the work allows. An allowed host that stores data for any account can
+  carry data out (SPEC.md §3), and in `trusted` the list also decides what strangers' text the
+  agent reads. Prefer exact names to whole domains: `github.com` rather than `.github.com`, which
+  would also allow `gist.github.com`; `pypi.org` without the leading dot excludes
+  `upload.pypi.org`, and pip downloads from `files.pythonhosted.org`. Where one host serves both,
+  as npm's registry and GitHub do, and for the agent's own model API, output review is the
+  control.
 
 ## 6. Image
 
-A base image with the shared tooling, running as a non-root user:
-
-```dockerfile
-# ~/.aiws/Dockerfile
-FROM debian:stable-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git less openssh-client ripgrep fd-find zsh \
-      build-essential postgresql-client locales \
-    && rm -rf /var/lib/apt/lists/*
-# Also install system-wide (under /usr/local): a current nvim release, mise, and the priviledge
-# client/relay.
-RUN useradd -m -s /bin/zsh aiws && mkdir /home/aiws/src && chown aiws /home/aiws/src
-USER aiws
-WORKDIR /home/aiws
-```
+`~/.aiws/Dockerfile` builds `aiws-base`: Debian stable with the shared tooling (git, curl, ripgrep,
+fd, zsh, a compiler toolchain, the Postgres client), a UTF-8 locale, a pinned nvim release, and a
+non-root user, `aiws`. `aiws build` builds it in each running VM, since VMs don't share images.
+The build runs in the VM's Docker Engine, outside any guest and its proxy, so the downloads it
+makes (Debian packages, the nvim release from GitHub) never need to be in a guest's allow-list.
 
 - **What goes in the image and what goes in the home** follows from one fact: Docker copies the
   image's `/home/aiws` into the volume only once, when the volume is created, so anything the
-  image installs under the home never updates afterwards. Tools that install under `/usr/local`
-  (nvim, mise, priviledge, system packages) therefore live in the image, rebuilt from the
-  privileged side. Tools that install into the home (nvim's plugin manager and mason, mise's
-  toolchains, the agent and its self-updater) are installed from inside the guest. LSP servers can
-  go either way: system-wide in the image, more reproducible at the cost of a rebuild per change,
-  or through mason in the home. Baking a project's toolchain into a per-project image
-  (`FROM aiws-base`) is the reproducible option once it settles.
+  image installs under the home never updates afterwards. Tools that install system-wide (system
+  packages, nvim, priviledge) therefore live in the image, rebuilt from the privileged side. Tools
+  that install into the home (nvim's plugins, language toolchains, the agent and its self-updater)
+  are installed from inside the guest, through its proxy. Baking a project's toolchain into a
+  per-project image (`FROM aiws-base`) is the reproducible option once it settles.
 - No sudo in the guest; `cap_drop` and `no-new-privileges` would defeat it anyway. Installing
   system packages means rebuilding the image from the privileged side.
 - priviledge is one program (DESIGN.md §1), installed the same way everywhere; in the guest only
@@ -364,18 +274,8 @@ set -g monitor-bell on
 set -g bell-action other
 ```
 
-A per-guest window:
-
-```sh
-#!/bin/sh
-# ~/.aiws/bin/aiws-window: aiws-window <profile> <name>
-p=$1; n=$2; sock="$HOME/.aiws/run/$p-$n.serve"
-mkdir -p "${sock%/*}"
-tmux new-window -n "$p/$n" "aiws exec $p $n nvim"
-tmux split-window -h "aiws exec $p $n opencode"
-tmux split-window -v "aiws exec $p $n"
-tmux split-window -v "dtach -A $sock -r winch priviledge serve $p $n"   # approvals for this guest
-```
+A per-guest window, `aiws-window <profile> <name>`: the editor, the agent and a shell in the guest
+(`aiws exec`), and the guest's approval pane, `priviledge serve <profile> <name>` under `dtach`.
 
 - **The approval pane in more than one window.** tmux can't show one pane in two windows, so the
   broker runs under `dtach`, which multiplexes its terminal: a second window attaches to the same
@@ -389,7 +289,7 @@ tmux split-window -v "dtach -A $sock -r winch priviledge serve $p $n"   # approv
   so no terminal device is shared with the guest. What remains is escape sequences in guest
   output, which is why clipboard reads are denied and priviledge escapes agent text.
 - The terminal's `TERM` (`xterm-ghostty`, say) needs its terminfo in the image. Either
-  install it or use `xterm-256color`, as in §4.
+  install it or use `xterm-256color`, which `aiws new` sets.
 - A privileged window holds a shell in the clean clones (§11) for review, push, deploy and project
   compose.
 
@@ -548,12 +448,12 @@ the guest's git credential store); a `public` guest clones public repos anonymou
 work; push is rejected by the server.
 
 **On the privileged side:** a clean clone per repo, with the guest as a remote through git's
-`ext::` transport, which runs git's protocol over the same command `guest_exec` uses:
+`ext::` transport, which runs git's protocol over the same command `guest_exec` uses (§14):
 
 ```sh
 git clone git@git.example.com:org/shop-app.git ~/src-clean/shop-app
 cd ~/src-clean/shop-app
-git remote add aiws 'ext::docker exec -i aiws-trusted-shop %S /home/aiws/src/shop-app'
+git remote add aiws 'ext::docker --context colima-aiws exec -i aiws-trusted-shop %S /home/aiws/src/shop-app'
 git config protocol.ext.allow user
 git config transfer.fsckObjects true
 ```
@@ -590,8 +490,8 @@ id=$(priviledge request git-token -r "git credential for a fetch" </dev/null) &&
 2. *Authoritative pass* in the clean clone over the fetched objects, in a git tool that does not
    run project code: Sublime Merge (syntax-highlighted; a small parsing risk, like any
    highlighter), `git` + `delta` + `less`, or `git log -p` piped into the review nvim of §8. It is
-   quick because the change is already
-   understood: it checks that the change is what was reviewed and catches anything new.
+   quick because the change is already understood: it checks that the change is what was
+   reviewed and catches anything new.
 
 **Push and deploy:**
 
@@ -609,24 +509,18 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
 
 - The human runs each project's compose from the clean clone at a reviewed commit, so review
   covers its mounts, privileges and build contexts.
-- A privileged-owned override moves every service onto the guest's network only, and drops its
-  published ports:
+- A privileged-owned override (`~/.aiws/overrides/example.yml` shows one) moves every service onto
+  the guest's network only, and drops its published ports:
 
-  ```yaml
-  # ~/.aiws/overrides/shop-app.yml
-  services:
-    app-postgres:
-      networks: !override [aiws]
-      ports: !reset []
-  networks:
-    aiws:
-      name: aiws-trusted-shop
-      external: true
+  ```sh
+  docker --context colima-aiws compose -f docker-compose.yml -f ~/.aiws/overrides/shop-app.yml up -d
   ```
 
-  `docker compose -f docker-compose.yml -f ~/.aiws/overrides/shop-app.yml up -d`
-  (`!override` and `!reset` need Compose 2.24 or later **(verify)**). Create the guest first: it
-  creates the network.
+  Checked with Compose 5.5: a service defined with two networks and a published port came up on
+  the guest's network only, with none published (`!override` and `!reset` need Compose 2.24 or
+  later). Create the guest first: it creates the network. Build contexts are sent by the client,
+  but files a compose file bind-mounts from the clean clone must be visible in the VM: add the
+  clean clones to the VM's mounts, read-only (§2).
 - **Why only the guest's network.** The guest can take over what it reaches: with the dev
   database's superuser, which dev setups usually hand out, `COPY ... TO PROGRAM` runs a program
   inside the service's container. A service that also had a normal network would give the guest
@@ -634,15 +528,15 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
   On the internal network, services still reach each other by name and the daemon still pulls
   their images; one that needs the internet at run time gives its guest that route, which is
   never acceptable for `public`. The human reaches a dev database from the guest, or with
-  `docker compose exec` from the clean clone.
+  `docker --context colima-aiws compose exec` from the clean clone.
 - The guest reaches services by name (`psql -h app-postgres`). Projects that hard-code
   `localhost` need their host settings overridden in the guest's environment. HTTP services (a
   search engine on port 9200, say) also go in the guest's `AIWS_NO_PROXY` (§4), or clients send
   them to the egress proxy, which refuses them.
 - **Dev servers run in the guest.** Services that call back into the dev server (a reverse proxy
   container, for example) must be attached to the guest's network in the override too, and point
-  at the guest by name instead of `host.docker.internal`. The human opens them in the browser
-  through the guest's forwarded port (§4).
+  at the guest by name instead of the host. The human opens them in the browser through a port
+  forwarded with `aiws port` (§4).
 - **The browser is the one host program that runs guest-authored code**: the dev server's pages
   and scripts. It is accepted because rendering hostile pages in a sandbox is what a browser is
   for, and a dev server is at worst a malicious website. What the sandbox doesn't cover is handled
@@ -653,15 +547,24 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
 
 ## 13. Host exposure and hygiene
 
-- **Host loopback.** On Docker Desktop, containers on a normal network reach services listening on
-  the host's loopback through `host.docker.internal` (checked on 29.8). Guests in this setup are
-  never on a normal network, nor are their dev services (§12), and their proxies refuse private
+- **Host loopback.** In colima's VMs, containers on a normal network reach the host at
+  `192.168.5.2` (`host.lima.internal`, also `host.docker.internal`), including services that
+  listen only on the host's `127.0.0.1` (checked on colima 0.10.3). Guests in this setup are never
+  on a normal network, nor are their dev services (§12), and their proxies refuse private
   addresses (§5), but the proxies and forwarders are. Anything the privileged side runs on
-  localhost, and every published port, is reachable from those, and from pages the browser renders
+  localhost, and every forwarded port, is reachable from those, and from pages the browser renders
   from a guest (§12). Audit with `lsof -nP -iTCP -sTCP:LISTEN` and make sure nothing sensitive
   listens without authentication. priviledge itself listens on nothing.
-- **No secrets in guests.** Nothing from the privileged home is mounted except the read-only
-  dotfiles and the exchange directory.
+- **What colima forwards to the host.** Ports the VM listens on are forwarded to the host: those on
+  the VM's `127.0.0.1` to the host's loopback, those on `0.0.0.0` to all the host's interfaces,
+  the local network included (colima's default, matching Docker's meaning of `-p 8000:8000`).
+  Nothing this setup starts listens on `0.0.0.0` in the VM, and guests can't publish ports. A
+  guest that escaped into its VM could, and would also have the VM's unfiltered outbound network;
+  both are part of what an escape reaches. One quirk: the host shows colima listening on TCP port
+  53 on all interfaces, for the VM's DNS forwarder; it accepts connections and resets them.
+- **No secrets in guests.** Nothing from the privileged home is mounted into guests except the
+  read-only dotfiles and the exchange directory; into the VMs, also the read-only egress
+  configuration (§2).
 - **Tracked secrets in repos** reach the guest with the clone. They are a team issue: rotate and
   remove.
 - **The global gitignore** must reach guests through the dotfiles. Otherwise personal files
@@ -673,15 +576,17 @@ The same priviledge configuration works with a different `guest_exec` template p
 
 | Setup | `guest_exec` | Notes |
 |---|---|---|
-| Docker / colima / Podman (this document) | `docker exec -i aiws-{profile}-{name}` | VM boundary to the host on macOS |
+| colima (this document) | `docker --context colima-aiws exec -i aiws-{profile}-{name}` | Dedicated VMs that see only their mounts; read-only enforced by the host |
+| Docker Desktop, Podman machine | `docker exec -i aiws-{profile}-{name}` (or `podman`) | One VM shared with all the machine's containers: what an escape reaches is its file sharing, by default the whole home |
 | Apple `container` (macOS 26) | `container exec -i aiws-{profile}-{name}` **(verify)** | One lightweight VM per container: a VM boundary between guests too. Same OCI images. A blocklist but no egress allow-list yet **(verify)**; the proxy sidecar of §5 still works |
 | Lima VM | `limactl shell aiws-{profile}-{name}` or `ssh` **(verify)** | Full VM per guest; the agent can run its own Docker inside |
 | Docker Sandboxes | its exec command, if it has one **(verify)** | microVM per sandbox with its own egress proxy; mounts the host project directory |
 | Separate OS user | `ssh aiws-{profile}-{name}@127.0.0.1` or `sudo -u aiws-{profile}-{name}` | See below |
 
 **On a Linux host,** containers share the host kernel directly, with no VM in between, and the
-Docker daemon runs as root. A container escape is then a host compromise. Prefer rootless Docker
-or Podman, a sandboxed runtime (gVisor, Kata), or VMs.
+Docker daemon runs as root. A container escape is then a host compromise. colima runs on Linux too,
+in a qemu VM, which keeps this setup's shape **(verify)**; otherwise prefer rootless Docker or
+Podman, or a sandboxed runtime (gVisor, Kata).
 
 **Separate OS user** (the only option with no runtime): one user per guest; close the privileged
 home to them (`chmod o-rwx ~`; they are not in the privileged user's group), and give each its own
@@ -701,32 +606,29 @@ keyed on uid (`pf` on macOS, nftables on Linux) **(verify)**, so until those exi
 
 ## 15. Verification checklist
 
-From inside a `trusted` or `public` guest:
+`aiws verify <profile> <name> [allowed-url]` runs the automatic part. It checks the container's
+shape from the host (`docker inspect`), then pipes a script into the guest's shell and reads what
+it prints, so nothing from the guest runs on the host. It exits non-zero if any check fails.
 
-- `/proc/self/mountinfo` shows no host paths besides the dotfiles and the exchange directory.
-- `touch ~/.dotfiles/x` fails: dotfiles are read-only.
-- There is no runtime socket: `find / -type s 2>/dev/null` lists nothing but the relay's.
-- `git push` to upstream is rejected by the server.
-- Other guests don't resolve (`getent hosts aiws-<other>` fails).
-- `curl https://example.com` fails (not allow-listed); `curl https://<allowed host>` works;
-  `curl http://host.docker.internal:<port>` fails, directly and through the proxy.
-- `getent hosts example.com` fails: external names don't resolve in the guest.
-- An HTTP dev service listed in `AIWS_NO_PROXY` answers by name.
+| Profile | Checks |
+|---|---|
+| all | not privileged; all capabilities dropped; `no-new-privileges`; own PID namespace; no runtime socket mounted; exactly the expected mounts |
+| `trusted`, `public` | only on its internal network; dotfiles present, read-only, not writable; no Unix sockets besides the relay's; the proxy refuses a host off the allow-list with its own 403; `allowed-url`, if given, works |
+| `trusted`, `public`, `hostile-web` | external names don't resolve; the proxy refuses the host and a private address; no route to the host or the internet around the proxy; other guests' containers don't resolve |
+| `hostile-web` | the public internet works through the proxy |
+| `hostile-sample` | no network, no routes, no connection to the internet |
+
+Checked on colima 0.10.3 (Docker Engine in `vz` VMs) for all three profile shapes, including a
+negative run: an `allowed-url` that is off the list fails. The rest is manual:
+
+- What each VM sees of the host: `colima ssh -p aiws -- mount | grep virtiofs` lists exactly the
+  configured mounts, writable only the exchange root (§2).
+- `git push` to upstream from a guest is rejected by the server.
+- An HTTP dev service listed in `AIWS_NO_PROXY` answers by name; a port forwarded with
+  `aiws port` answers on `127.0.0.1` on the host.
+- The proxy's log shows only allow-listed hosts passing (§5).
+- Dev-service containers have no route out: `docker --context colima-aiws compose exec` into one
+  and try an external address and `192.168.5.2`.
+- Loopback listeners on the host (`lsof -nP -iTCP -sTCP:LISTEN`) are known and acceptable (§13).
 - Once the core loop exists: `priviledge list` shows only this profile's resources, and stopping
   the guest's `priviledge serve` makes `request` fail fast.
-
-From inside a `hostile-web` guest: `curl https://example.com` works;
-`curl http://host.docker.internal` and an address on the local network both fail.
-
-From inside a `hostile-sample` guest: no network at all (`ip route` shows nothing, and `curl` to
-any address fails at once).
-
-From the host:
-
-- A dev server started in a guest answers on `http://127.0.0.1:<AIWS_PORT>`.
-- The runtime's shared paths are only the dotfiles, egress configuration, exchange and clean-clone
-  directories.
-- Loopback listeners reachable via `host.docker.internal` are known and acceptable.
-- The proxy's log shows only allow-listed hosts passing.
-- Dev-service containers have no route out: from the clean clone, `docker compose exec` into one
-  and try an external address and `host.docker.internal`.

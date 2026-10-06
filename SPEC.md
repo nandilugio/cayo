@@ -569,7 +569,7 @@ run = "~/.priviledge/resources/ask-human"   # echoes the task back (§8, human r
 input = "stdin"
 
 [profiles.trusted]
-guest_exec = ["docker", "exec", "-i", "aiws-{profile}-{name}"]
+guest_exec = ["docker", "--context", "colima-aiws", "exec", "-i", "aiws-{profile}-{name}"]
 notify = "bell"
 [profiles.trusted.resources]
 prod-db-ro = { confirm_request = false, confirm_output = false }
@@ -578,7 +578,7 @@ aws-readonly = { confirm_request = false }
 ask-human = {}
 
 [profiles.public]
-guest_exec = ["docker", "exec", "-i", "aiws-{profile}-{name}"]
+guest_exec = ["docker", "--context", "colima-aiws", "exec", "-i", "aiws-{profile}-{name}"]
 notify = "bell"
 [profiles.public.resources]
 prod-db-ro = {}            # every request and every output is confirmed
