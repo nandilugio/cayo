@@ -2,19 +2,22 @@
 # ~/.aiws/bin/aiws: create, remove and enter guests (SETUP.md §4).
 #   aiws new    <profile> <name>                create the guest aiws-<profile>-<name>
 #   aiws rm     <profile> <name>                remove it, with its network, sidecars and home volume
+#   aiws recreate <profile> <name>              recreate it from the current images, keeping its
+#                                               home volume and forwarded ports
 #   aiws exec   <profile> <name> [cmd...]       run a command in it (default: a shell)
 #   aiws port   <profile> <name> <port>[:<guest-port>]
 #                                               forward 127.0.0.1:<port> on the host to the guest
 #   aiws reload <profile> <name>                reload its proxy, after editing its allow-list
 #   aiws verify <profile> <name> [allowed-url]  check it against SETUP.md §15
-#   aiws build                                  build the guest image in each VM that is running
+#   aiws build                                  rebuild the guest image in each running VM, with
+#                                               updated base and sidecar images
 #   aiws vm start|stop|delete <vm>              create or start a VM (aiws, aiws-hostile) with its
 #                                               mounts; stop it; delete it with all its data
 # Profiles are the ones in priviledge's configuration (SPEC.md §8). Here each one is a container
 # shape: which VM it runs in, what is mounted, and how it reaches the network.
 set -eu
 
-usage() { sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 die() { echo "aiws: $*" >&2; exit 1; }
 vms="aiws aiws-hostile"
 egress_dir="$HOME/.aiws/egress"
@@ -37,8 +40,16 @@ vm_start() {
     # --activate=false: the machine's default Docker context stays what it was.
     colima start --profile "$vm" --activate=false "$@"
   fi
-  docker --context "colima-$vm" image inspect aiws-base >/dev/null 2>&1 \
-    || docker --context "colima-$vm" build -t aiws-base "$HOME/.aiws"
+  docker --context "colima-$vm" image inspect aiws-base >/dev/null 2>&1 || build_images "$vm"
+}
+
+# The guest image, on a freshly pulled base, and the sidecars' images; then drop the images the
+# rebuild left unused. Guests keep the images they were created from until `aiws recreate`.
+build_images() {
+  echo "aiws: building aiws-base in $1"
+  docker --context "colima-$1" build --pull -t aiws-base "$HOME/.aiws"
+  for image in ubuntu/squid alpine/socat; do docker --context "colima-$1" pull -q "$image" >/dev/null; done
+  docker --context "colima-$1" image prune -f >/dev/null
 }
 
 if [ "${1:-}" = vm ]; then
@@ -57,9 +68,7 @@ fi
 
 if [ "${1:-}" = build ]; then
   for vm in $vms; do
-    docker --context "colima-$vm" info >/dev/null 2>&1 || continue
-    echo "aiws: building aiws-base in $vm"
-    docker --context "colima-$vm" build -t aiws-base "$HOME/.aiws"
+    docker --context "colima-$vm" info >/dev/null 2>&1 && build_images "$vm"
   done
   exit
 fi
@@ -151,11 +160,27 @@ forward_port() {
   docker network connect "$guest" "$forwarder"
 }
 
-remove_guest() {
+# The guest's containers and network; its home volume stays.
+remove_containers() {
   docker ps -a --format '{{.Names}}' | grep -E "^$guest(-proxy|-port-[0-9]+)?\$" \
     | xargs docker rm -f -v >/dev/null 2>&1 || true  # -v: also the images' anonymous volumes
   docker network rm "$guest" >/dev/null 2>&1 || true
-  docker volume rm "$home_volume"
+}
+
+# The forwarded ports, as <host-port>:<guest-port>, read from the forwarders themselves.
+forwarded_ports() {
+  docker ps -a --format '{{.Names}}' | grep -E "^$guest-port-[0-9]+\$" | while read -r forwarder; do
+    docker inspect -f '{{range $p, $b := .HostConfig.PortBindings}}{{(index $b 0).HostPort}}:{{$p}}{{end}}' \
+      "$forwarder" | sed 's#/tcp$##'
+  done
+}
+
+recreate_guest() {
+  docker inspect "$guest" >/dev/null 2>&1 || die "no guest $guest"
+  ports=$(forwarded_ports)
+  remove_containers
+  new_guest
+  for port in $ports; do forward_port "$port"; done
 }
 
 enter_guest() {
@@ -165,7 +190,8 @@ enter_guest() {
 
 case $command in
   new)    new_guest ;;
-  rm)     remove_guest ;;
+  rm)     remove_containers; docker volume rm "$home_volume" ;;
+  recreate) recreate_guest ;;
   exec)   enter_guest "$@" ;;
   port)   forward_port "$@" ;;
   reload) docker exec "$guest-proxy" squid -k reconfigure ;;

@@ -89,8 +89,9 @@ isn't running stops and names the command that starts it.
   again by its tag. So an escape reaches the exchange directories (writable by guests anyway),
   and can read the dotfiles and egress configuration, which hold nothing secret.
 - **`--activate=false`**, which `aiws vm start` passes and the VM's profile remembers, keeps
-  colima from making the VM the Docker CLI's default context. The scripts select a VM explicitly (`docker --context colima-aiws`), and every other `docker`
-  command on the machine keeps going where it went before.
+  colima from making the VM the Docker CLI's default context. The scripts select a VM explicitly
+  (`docker --context colima-aiws`), and every other `docker` command on the machine keeps going
+  where it went before.
 - **Changing mounts** (adding the clean clones that a project's compose file bind-mounts, §12):
   edit the list in `aiws`, then `aiws vm stop aiws` and `aiws vm start aiws`. colima stores the
   list in the VM's profile, so a running VM keeps the one it started with.
@@ -135,12 +136,15 @@ guest's shape is decided inside it.
 ```
 aiws new    <profile> <name>                create the guest aiws-<profile>-<name>
 aiws rm     <profile> <name>                remove it, with its network, sidecars and home volume
+aiws recreate <profile> <name>              recreate it from the current images, keeping its
+                                            home volume and forwarded ports
 aiws exec   <profile> <name> [cmd...]       run a command in it (default: a shell)
 aiws port   <profile> <name> <port>[:<guest-port>]
                                             forward 127.0.0.1:<port> on the host to the guest
 aiws reload <profile> <name>                reload its proxy, after editing its allow-list
 aiws verify <profile> <name> [allowed-url]  check it against §15
-aiws build                                  build the guest image in each VM that is running
+aiws build                                  rebuild the guest image in each running VM, with
+                                            updated base and sidecar images
 aiws vm start|stop|delete <vm>              create or start a VM (aiws, aiws-hostile) with its
                                             mounts; stop it; delete it with all its data
 ```
@@ -260,6 +264,12 @@ makes (Debian packages, the nvim release from GitHub) never need to be in a gues
   per-project image (`FROM aiws-base`) is the reproducible option once it settles.
 - No sudo in the guest; `cap_drop` and `no-new-privileges` would defeat it anyway. Installing
   system packages means rebuilding the image from the privileged side.
+- **Updating.** `aiws build` rebuilds on a freshly pulled Debian base, so security updates come
+  in with every rebuild, pulls the proxy and forwarder images, and drops the images left unused.
+  Guests keep the image they were created from until `aiws recreate`, which replaces the guest's
+  containers and keeps its home volume and its forwarded ports (checked: a file in the home and
+  two forwarded ports survived a recreate onto a rebuilt image). Whatever runs in the guest at
+  that moment, agents and editors included, ends.
 - priviledge is one program (DESIGN.md §1), installed the same way everywhere; in the guest only
   its client and relay subcommands are used. It must be on the default `PATH`, since `guest_exec`
   runs it without a login shell. Its integrity in the guest doesn't matter (SPEC.md §3): it only
