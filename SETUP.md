@@ -72,9 +72,9 @@ aiws vm start aiws-hostile    # when a hostile task needs it
 ```
 
 `aiws vm start` runs `colima start` with the VM's full list of mounts: for `aiws`, its exchange
-root (`~/aiws-exchange/aiws`, writable), `~/.aiws/egress` and the dotfiles' real path; for
-`aiws-hostile`, its own exchange root and `~/.aiws/egress`. Any other `aiws` command whose VM
-isn't running stops and names the command that starts it.
+root (`~/aiws-exchange/aiws`, writable) and the dotfiles' real path; for `aiws-hostile`, only its
+own exchange root. The proxies' configuration is copied into them instead (§5), so no VM mounts
+it. Any other `aiws` command whose VM isn't running stops and names the command that starts it.
 
 - **Why dedicated VMs.** A guest that escapes its container (a kernel or runtime flaw, SPEC.md §3)
   lands in the VM and reaches whatever the VM can see. A general-purpose runtime's VM usually
@@ -87,7 +87,7 @@ isn't running stops and names the command that starts it.
   enforces read-only**: checked on colima 0.10.3 (Lima 2.2.1), root inside the VM could neither
   write to a read-only mount, nor after remounting it read-write, nor after mounting the share
   again by its tag. So an escape reaches the exchange directories (writable by guests anyway),
-  and can read the dotfiles and egress configuration, which hold nothing secret.
+  and in the `aiws` VM can read the dotfiles, which hold nothing secret.
 - **`--activate=false`**, which `aiws vm start` passes and the VM's profile remembers, keeps
   colima from making the VM the Docker CLI's default context. The scripts select a VM explicitly
   (`docker --context colima-aiws`), and every other `docker` command on the machine keeps going
@@ -142,6 +142,8 @@ aiws exec   <profile> <name> [cmd...]       run a command in it (default: a shel
 aiws port   <profile> <name> <port>[:<guest-port>]
                                             forward 127.0.0.1:<port> on the host to the guest
 aiws reload <profile> <name>                reload its proxy, after editing its allow-list
+aiws denied <profile> <name>                the hosts its proxy refused, most frequent first
+aiws allow  <profile> <name> <host>...      add hosts to its allow-list, and reload
 aiws verify <profile> <name> [allowed-url]  check it against §15
 aiws build                                  rebuild the guest image in each running VM, with
                                             updated base and sidecar images
@@ -219,10 +221,22 @@ item 5). The mechanism for every guest with a network: **the network denies, the
 
 The proxy is Squid, configured by `~/.aiws/egress/squid-allowlist.conf` or `squid-public.conf`,
 and, in allow-list mode, by the guest's own list, `~/.aiws/egress/aiws-<profile>-<name>.txt`: one
-hostname per line, a leading dot for subdomains too, `#` for comments. The VMs mount the egress
-directory read-only (§2), so a list is edited on the host and applied with `aiws reload`; nothing
-in a guest or a VM can change it. A list may be empty: Squid warns about the empty ACL and
-refuses everything. `allow-list.example.txt` is a commented starting point.
+hostname per line, a leading dot for subdomains too, `#` for comments. `aiws` copies both into
+the proxy when it starts it, and again on `aiws reload` (`docker cp`, which reads them on the
+host, links resolved), so no VM mounts them and nothing in a guest or a VM can change them. A
+list may be empty: Squid warns about the empty ACL and refuses everything.
+`allow-list.example.txt` is a commented starting point.
+
+Allowing a host, with the guest running:
+
+1. `aiws denied trusted shop` lists the hosts its proxy refused, from the proxy's log (`aiws
+   verify`'s own probes show up there too).
+2. Decide: the exact name rather than a whole domain, and whether the host stores data for any
+   account (below).
+3. `aiws allow trusted shop api.example.com` adds it and reloads the proxy; no restart of the
+   guest or its sessions. Editing the file by hand and running `aiws reload` does the same, but
+   `aiws allow` also checks that each entry is a hostname: Squid reads every word on a line as a
+   separate name.
 
 Notes:
 
@@ -235,9 +249,8 @@ Notes:
   (the guest holds a placeholder token, the proxy swaps in the real one at egress, so git's native
   token, SPEC.md §5, never enters the guest), at the cost of terminating TLS: every client in the
   guest must trust its CA.
-- Denied hosts are in the proxy's log (`docker --context colima-aiws exec
-  aiws-<profile>-<name>-proxy tail /var/log/squid/access.log`); reviewing it is how allow-lists
-  grow. Approval of new hosts through priviledge is in the backlog (SPEC.md §10).
+- Reviewing denied hosts is how allow-lists grow. Approval of new hosts through priviledge, as a
+  prompt in the approval pane, is in the backlog (SPEC.md §10).
 - Start lists as empty as the work allows. An allowed host that stores data for any account can
   carry data out (SPEC.md §3), and in `trusted` the list also decides what strangers' text the
   agent reads. Prefer exact names to whole domains: `github.com` rather than `.github.com`, which
@@ -585,9 +598,8 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
   guest that escaped into its VM could, and would also have the VM's unfiltered outbound network;
   both are part of what an escape reaches. One quirk: the host shows colima listening on TCP port
   53 on all interfaces, for the VM's DNS forwarder; it accepts connections and resets them.
-- **No secrets in guests.** Nothing from the privileged home is mounted into guests except the
-  read-only dotfiles and the exchange directory; into the VMs, also the read-only egress
-  configuration (§2).
+- **No secrets in guests.** Nothing from the privileged home is mounted into guests or their VMs
+  except the read-only dotfiles and the exchange directories (§2).
 - **Tracked secrets in repos** reach the guest with the clone. They are a team issue: rotate and
   remove.
 - **The global gitignore** must reach guests through the dotfiles. Otherwise personal files

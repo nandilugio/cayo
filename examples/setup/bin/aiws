@@ -8,6 +8,8 @@
 #   aiws port   <profile> <name> <port>[:<guest-port>]
 #                                               forward 127.0.0.1:<port> on the host to the guest
 #   aiws reload <profile> <name>                reload its proxy, after editing its allow-list
+#   aiws denied <profile> <name>                the hosts its proxy refused, most frequent first
+#   aiws allow  <profile> <name> <host>...      add hosts to its allow-list, and reload
 #   aiws verify <profile> <name> [allowed-url]  check it against SETUP.md §15
 #   aiws build                                  rebuild the guest image in each running VM, with
 #                                               updated base and sidecar images
@@ -17,21 +19,22 @@
 # shape: which VM it runs in, what is mounted, and how it reaches the network.
 set -eu
 
-usage() { sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 die() { echo "aiws: $*" >&2; exit 1; }
 vms="aiws aiws-hostile"
 egress_dir="$HOME/.aiws/egress"
 
 # The VMs (SETUP.md §2). This is their one definition: what each mounts from the host, read-only
 # unless marked :w, and nothing else. The dotfiles by their real path, which is what guests mount.
+# The proxies' configuration is copied into them (start_proxy), so no VM mounts it.
 vm_start() {
   vm=$1; exchange_root="$HOME/aiws-exchange/$vm"
   case $vm in
     aiws)
       dotfiles=$(cd "$HOME/.aiws/dotfiles" 2>/dev/null && pwd -P) || die "missing ~/.aiws/dotfiles"
-      set -- --cpus 4 --memory 8 --mount "$exchange_root:w" --mount "$egress_dir" --mount "$dotfiles" ;;
+      set -- --cpus 4 --memory 8 --mount "$exchange_root:w" --mount "$dotfiles" ;;
     aiws-hostile)
-      set -- --cpus 2 --memory 2 --mount "$exchange_root:w" --mount "$egress_dir" ;;
+      set -- --cpus 2 --memory 2 --mount "$exchange_root:w" ;;
   esac
   if docker --context "colima-$vm" info >/dev/null 2>&1; then
     echo "aiws: $vm is running; to change its mounts: aiws vm stop $vm, then start it again"
@@ -85,41 +88,68 @@ home_volume="$guest-home"
 
 # The VM the guest runs in (SETUP.md §2): hostile guests never share one with the others.
 case $profile in
-  trusted|public)             vm=aiws ;;
-  hostile-web|hostile-sample) vm=aiws-hostile ;;
+  trusted|public)             vm=aiws;         egress=allowlist ;;
+  hostile-web)                vm=aiws-hostile; egress=public ;;
+  hostile-sample)             vm=aiws-hostile; egress=none ;;
   *) echo "aiws: unknown profile $profile" >&2; exit 64 ;;
 esac
+allow_list="$egress_dir/$guest.txt"
 export DOCKER_CONTEXT="colima-$vm"
 docker info >/dev/null 2>&1 || die "VM $vm isn't running; start it with: aiws vm start $vm"
 exchange_dir="$HOME/aiws-exchange/$vm/$guest"
 
 # The egress proxy (SETUP.md §5): on the guest's internal network and on the bridge, the guest's
-# only way out. Its configuration is read from the VM's read-only mount of ~/.aiws/egress.
+# only way out. Its configuration and allow-list are copied in from the host (docker cp, which
+# reads them on the host, links resolved), so no VM mounts them, and edits take `aiws reload`.
+copy_proxy_config() {
+  docker cp -L "$egress_dir/squid-$egress.conf" "$guest-proxy:/etc/squid/squid.conf"
+  [ "$egress" != allowlist ] || docker cp -L "$allow_list" "$guest-proxy:/etc/squid/allow.txt"
+}
+
 start_proxy() {
-  mode=$1; list=
-  if [ "$mode" = allowlist ]; then
-    f="$egress_dir/$guest.txt"     # must exist: Docker would create a directory in its place
-    [ -f "$f" ] || die "missing allow-list $f"
-    list="-v $f:/etc/squid/allow.txt:ro"
-  fi
-  # shellcheck disable=SC2086 # $list is an option, or nothing
-  docker run -d --name "$guest-proxy" --network bridge $list \
-    -v "$egress_dir/squid-$mode.conf:/etc/squid/squid.conf:ro" \
-    ubuntu/squid >/dev/null
+  [ "$egress" != allowlist ] || [ -f "$allow_list" ] || die "missing allow-list $allow_list"
+  docker create --name "$guest-proxy" --network bridge ubuntu/squid >/dev/null
+  copy_proxy_config
+  docker start "$guest-proxy" >/dev/null
   docker network connect --alias "$guest-proxy" "$guest" "$guest-proxy"
+}
+
+reload_proxy() {
+  [ "$egress" != none ] || die "$guest has no network, so no proxy"
+  copy_proxy_config
+  out=$(docker exec "$guest-proxy" squid -k reconfigure 2>&1) || { echo "$out" >&2; die "reload failed"; }
+}
+
+# The hosts the proxy refused, from its log: CONNECT host:port, or a plain HTTP URL.
+denied_hosts() {
+  [ "$egress" != none ] || die "$guest has no network, so no proxy"
+  docker exec "$guest-proxy" cat /var/log/squid/access.log \
+    | awk '$4 ~ /DENIED/ { print $7 }' | sed -E 's#^[a-z]+://##; s#[:/].*##' \
+    | sort | uniq -c | sort -rn
+}
+
+allow_hosts() {
+  [ "$egress" = allowlist ] || die "$guest has no allow-list (profile $profile)"
+  [ $# -gt 0 ] || usage
+  for host in "$@"; do
+    # A hostname, or .domain for its subdomains too: nothing Squid could read as anything else.
+    printf '%s\n' "$host" | grep -Eqx '\.?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+' \
+      || die "not a hostname: $host"
+  done
+  for host in "$@"; do
+    grep -qxF "$host" "$allow_list" || printf '%s\n' "$host" >> "$allow_list"
+  done
+  reload_proxy
 }
 
 new_guest() {
   # 1. What the profile decides: the mounts, and the egress mode.
   mounts="-v $home_volume:/home/aiws -v $exchange_dir:/home/aiws/exchange"
-  case $profile in
-    trusted|public)
-      # The real path: the VM mounts it, not a link to it (SETUP.md §2).
-      dotfiles=$(cd "$HOME/.aiws/dotfiles" 2>/dev/null && pwd -P) || die "missing ~/.aiws/dotfiles"
-      mounts="$mounts -v $dotfiles:/home/aiws/.dotfiles:ro"; egress=allowlist ;;
-    hostile-web)    egress=public ;;
-    hostile-sample) egress=none ;;
-  esac
+  if [ "$profile" = trusted ] || [ "$profile" = public ]; then
+    # The real path: the VM mounts it, not a link to it (SETUP.md §2).
+    dotfiles=$(cd "$HOME/.aiws/dotfiles" 2>/dev/null && pwd -P) || die "missing ~/.aiws/dotfiles"
+    mounts="$mounts -v $dotfiles:/home/aiws/.dotfiles:ro"
+  fi
 
   # 2. Storage: the home volume and the per-guest exchange directory.
   docker volume create "$home_volume" >/dev/null
@@ -130,7 +160,7 @@ new_guest() {
     network="--network none"
   else
     docker network create --internal "$guest" >/dev/null
-    start_proxy "$egress"
+    start_proxy
     proxy="http://$guest-proxy:3128"
     no_proxy="localhost,127.0.0.1${AIWS_NO_PROXY:+,$AIWS_NO_PROXY}"  # HTTP dev services, §12
     network="--network $guest \
@@ -194,7 +224,9 @@ case $command in
   recreate) recreate_guest ;;
   exec)   enter_guest "$@" ;;
   port)   forward_port "$@" ;;
-  reload) docker exec "$guest-proxy" squid -k reconfigure ;;
+  reload) reload_proxy ;;
+  denied) denied_hosts ;;
+  allow)  allow_hosts "$@" ;;
   verify) exec "$bin/aiws-verify" "$profile" "$name" "$@" ;;
   *)      usage ;;
 esac
