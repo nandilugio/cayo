@@ -1,0 +1,18 @@
+# ~/.cayo/config: settings for cayo, a shell file read by the cayo commands. Everything is
+# optional; these are the defaults.
+
+# A directory mounted read-only into trusted and public guests (dotfiles, without secrets: a guest
+# reads every file in it, whatever its permissions), and where guests see it. cayo mounts its real
+# path, so it may be a link. The cayo VM mounts it too: after changing it, restart the VM.
+#CAYO_DOTFILES=~/.cayo/dotfiles
+#CAYO_DOTFILES_MOUNT=/home/cayo/.dotfiles
+
+# More host paths for the cayo VM, read-only, space-separated: the clean clones that a project's
+# compose file bind-mounts, for example. Restart the VM after changing it.
+#CAYO_VM_MOUNTS="$HOME/src-clean"
+
+# The agent cayo-window starts.
+#CAYO_AGENT=opencode
+
+# Variables named CAYO_INIT_* are passed to ~/.cayo/guest-init, here or in the environment.
+#CAYO_INIT_GIT_NAME="Your Name"

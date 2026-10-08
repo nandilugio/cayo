@@ -1,5 +1,5 @@
-# ~/.cayo/Dockerfile: the base image of every guest (SETUP.md §6). Build it from the host, in
-# each VM: `cayo build`.
+# The base image of every guest, cayo-base. `cayo build` builds it in each VM, alone (no build
+# context); extend it in ~/.cayo/image/Dockerfile (FROM cayo-base, see examples/image.Dockerfile).
 # Only what installs outside the home goes here: Docker copies the image's home into a guest's
 # home volume once, when the volume is created, so anything installed under it never updates.
 FROM debian:stable-slim
@@ -16,8 +16,6 @@ ARG NVIM_VERSION=v0.12.5
 RUN arch=$(uname -m | sed 's/aarch64/arm64/') \
     && curl -fsSL "https://github.com/neovim/neovim/releases/download/$NVIM_VERSION/nvim-linux-$arch.tar.gz" \
       | tar -xz -C /usr/local --strip-components=1
-
-# The penyero client and relay will be installed here too, system-wide, once they exist.
 
 RUN useradd -m -s /bin/zsh cayo && mkdir /home/cayo/src && chown cayo /home/cayo/src
 USER cayo

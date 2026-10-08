@@ -1,8 +1,8 @@
 # ~/.cayo/overrides/<project>.yml: run a project's dev services on its guest's network only, with
-# no published ports (SETUP.md §12). From the project's clean clone, at a reviewed commit:
+# no published ports (README.md, Dev services). From the project's clean clone, at a reviewed commit:
 #   docker --context colima-cayo compose -f docker-compose.yml -f ~/.cayo/overrides/<project>.yml up -d
 # Create the guest first: it creates the network. Every service gets the same two lines. Files the
-# compose file bind-mounts from the clean clone must be in the VM's mounts (SETUP.md §2).
+# compose file bind-mounts from the clean clone must be in the VM's mounts (CAYO_VM_MOUNTS).
 services:
   app-postgres:
     networks: !override [cayo]
