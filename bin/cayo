@@ -23,16 +23,20 @@ usage() { sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 die() { echo "cayo: $*" >&2; exit 1; }
 vms="cayo cayo-hostile"
 
-# The checkout holds the tool (this script, the base Dockerfile, the proxies' configuration);
-# ~/.cayo holds the user's files: config, guest-init, image/, egress/ allow-lists, overrides/.
-root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# The checkout holds the tool (this script, cayo-verify, the base Dockerfile, the proxies'
+# configuration); ~/.cayo holds the user's files: config, guest-init, image/, egress/ allow-lists.
+bin=$(dirname "$(readlink -f "$0")")
+root=$(cd "$bin/.." && pwd)
 user_dir="$HOME/.cayo"
 
 # Settings, overridable in ~/.cayo/config, a shell file of these variables (README.md).
 CAYO_DOTFILES="$user_dir/dotfiles"          # mounted read-only into trusted and public guests
 CAYO_DOTFILES_MOUNT=/home/cayo/.dotfiles    # where guests see it
 CAYO_VM_MOUNTS=                             # more host paths for the cayo VM, read-only
+CAYO_NO_PROXY=${CAYO_NO_PROXY:-}            # hosts a new guest reaches directly (its dev services)
 [ ! -f "$user_dir/config" ] || . "$user_dir/config"
+
+# ---- VMs and images ------------------------------------------------------------------------
 
 # The dotfiles' real path, which is what the VM mounts and guests bind, or nothing.
 dotfiles_path() { (cd "$CAYO_DOTFILES" 2>/dev/null && pwd -P) || true; }
@@ -74,48 +78,56 @@ build_images() {
   docker --context "colima-$1" image prune -f >/dev/null
 }
 
-if [ "${1:-}" = vm ]; then
-  [ $# -eq 3 ] || usage
-  case " $vms " in *" $3 "*) ;; *) die "unknown VM $3 (VMs: $vms)" ;; esac  # never another colima VM
-  case $2 in
-    start)  vm_start "$3" ;;
-    stop)   colima stop --profile "$3" ;;
+vm_command() {
+  [ $# -eq 2 ] || usage
+  case " $vms " in *" $2 "*) ;; *) die "unknown VM $2 (VMs: $vms)" ;; esac  # never another colima VM
+  case $1 in
+    start)  vm_start "$2" ;;
+    stop)   colima stop --profile "$2" ;;
     # --data: otherwise the VM's Docker data (images, guests' home volumes) stays on disk, and a
     # VM created later with the same name gets it back.
-    delete) colima delete --data --profile "$3" ;;
+    delete) colima delete --data --profile "$2" ;;
     *)      usage ;;
   esac
-  exit
-fi
+}
 
-if [ "${1:-}" = build ]; then
+build_command() {
+  built=
   for vm in $vms; do
-    docker --context "colima-$vm" info >/dev/null 2>&1 && build_images "$vm"
+    docker --context "colima-$vm" info >/dev/null 2>&1 || continue
+    build_images "$vm"; built=1
   done
-  exit
-fi
+  [ -n "$built" ] || die "no VM is running; start one with: cayo vm start cayo"
+}
 
-[ $# -ge 3 ] || usage
-command=$1; profile=$2; name=$3
-shift 3
-case $name in
-  *-*) echo "cayo: guest names can't contain '-' (cayo names sidecars by appending to them)" >&2; exit 64 ;;
-esac
-bin=$(dirname "$(readlink -f "$0")")
-guest="cayo-$profile-$name"        # the container; also the prefix of its network and sidecars
-home_volume="$guest-home"
+# ---- Guests ----------------------------------------------------------------------------------
 
-# The VM the guest runs in: hostile guests never share one with the others.
-case $profile in
-  trusted|public)             vm=cayo;         egress=allowlist ;;
-  hostile-web)                vm=cayo-hostile; egress=public ;;
-  hostile-sample)             vm=cayo-hostile; egress=none ;;
-  *) echo "cayo: unknown profile $profile" >&2; exit 64 ;;
-esac
-export DOCKER_CONTEXT="colima-$vm"
-docker info >/dev/null 2>&1 || die "VM $vm isn't running; start it with: cayo vm start $vm"
-exchange_dir="$HOME/cayo-exchange/$vm/$guest"
-allow_list="$user_dir/egress/$guest.txt"
+# The guest a command works on, from its profile and name; the VM it runs in (hostile guests never
+# share one with the others), selected for every docker command that follows.
+guest_context() {
+  profile=$1; name=$2
+  # Letters, digits, dots and underscores, as Docker accepts in a name, minus '-': cayo names a
+  # guest's network, volume and sidecars by appending to the container's name.
+  printf '%s\n' "$name" | grep -Eqx '[A-Za-z0-9][A-Za-z0-9_.]*' \
+    || die "guest names are letters, digits, '.' and '_', and don't start with '.' or '_': $name"
+  guest="cayo-$profile-$name"        # the container; also the prefix of its network and sidecars
+  home_volume="$guest-home"
+  case $profile in
+    trusted|public)             vm=cayo;         egress=allowlist ;;
+    hostile-web)                vm=cayo-hostile; egress=public ;;
+    hostile-sample)             vm=cayo-hostile; egress=none ;;
+    *) die "unknown profile $profile (profiles: trusted, public, hostile-web, hostile-sample)" ;;
+  esac
+  export DOCKER_CONTEXT="colima-$vm"
+  docker info >/dev/null 2>&1 || die "VM $vm isn't running; start it with: cayo vm start $vm"
+  exchange_dir="$HOME/cayo-exchange/$vm/$guest"
+  allow_list="$user_dir/egress/$guest.txt"
+}
+
+# Whether this guest gets the dotfiles: trusted and public guests, when there are any.
+guest_dotfiles() {
+  case $profile in trusted|public) dotfiles_path ;; esac
+}
 
 # The egress proxy: on the guest's internal network and on the bridge, the guest's only way out.
 # Its configuration and allow-list are copied in from the host (docker cp, which reads them on the
@@ -126,7 +138,13 @@ copy_proxy_config() {
 }
 
 start_proxy() {
-  [ "$egress" != allowlist ] || [ -f "$allow_list" ] || die "missing allow-list $allow_list"
+  if [ "$egress" = allowlist ] && [ ! -f "$allow_list" ]; then
+    # A new list starts empty, from the commented template: the proxy refuses everything until
+    # `cayo allow` adds hosts.
+    mkdir -p "$user_dir/egress"
+    cp "$root/examples/allow-list.txt" "$allow_list"
+    echo "cayo: created $allow_list, empty: add hosts with cayo allow $profile $name <host>..."
+  fi
   docker create --name "$guest-proxy" --network bridge ubuntu/squid >/dev/null
   copy_proxy_config
   docker start "$guest-proxy" >/dev/null
@@ -161,16 +179,15 @@ allow_hosts() {
   reload_proxy
 }
 
-# Whether this guest gets the dotfiles: trusted and public guests, when there are any.
-guest_dotfiles() {
-  case $profile in trusted|public) dotfiles_path ;; esac
-}
-
 new_guest() {
   # 1. What the profile decides: the mounts, and the egress mode.
   mounts="-v $home_volume:/home/cayo -v $exchange_dir:/home/cayo/exchange"
   dotfiles=$(guest_dotfiles)
-  [ -z "$dotfiles" ] || mounts="$mounts -v $dotfiles:$CAYO_DOTFILES_MOUNT:ro"
+  if [ -n "$dotfiles" ]; then
+    mounts="$mounts -v $dotfiles:$CAYO_DOTFILES_MOUNT:ro"
+  elif [ "$egress" = allowlist ]; then
+    echo "cayo: no dotfiles for $guest: CAYO_DOTFILES ($CAYO_DOTFILES) doesn't exist"
+  fi
 
   # 2. Storage: the home volume and the per-guest exchange directory.
   docker volume create "$home_volume" >/dev/null
@@ -183,7 +200,7 @@ new_guest() {
     docker network create --internal "$guest" >/dev/null
     start_proxy
     proxy="http://$guest-proxy:3128"
-    no_proxy="localhost,127.0.0.1${CAYO_NO_PROXY:+,$CAYO_NO_PROXY}"  # HTTP dev services
+    no_proxy="localhost,127.0.0.1${CAYO_NO_PROXY:+,$CAYO_NO_PROXY}"
     network="--network $guest \
       -e http_proxy=$proxy -e https_proxy=$proxy -e HTTP_PROXY=$proxy -e HTTPS_PROXY=$proxy \
       -e no_proxy=$no_proxy -e NO_PROXY=$no_proxy"
@@ -198,10 +215,12 @@ new_guest() {
 }
 
 # ~/.cayo/guest-init, piped into a new guest's shell (the host only sends it), with CAYO_PROFILE,
-# CAYO_NAME and every CAYO_INIT_* variable set in the environment or in ~/.cayo/config.
+# CAYO_NAME and every CAYO_INIT_* variable set in the environment or in ~/.cayo/config. Never for
+# hostile guests: they get nothing of the user's, those variables included.
 guest_init() {
   hook="$user_dir/guest-init"
   [ -f "$hook" ] || return 0
+  case $profile in hostile-*) return 0 ;; esac
   set -- -e CAYO_PROFILE="$profile" -e CAYO_NAME="$name"
   for var in $(set | sed -n 's/^\(CAYO_INIT_[A-Za-z0-9_]*\)=.*/\1/p'); do
     export "${var?}"; set -- "$@" -e "$var"
@@ -252,16 +271,31 @@ enter_guest() {
   exec docker exec -it -w /home/cayo/src "$guest" "$@"
 }
 
+verify_guest() {
+  dotfiles_mount=; [ -z "$(guest_dotfiles)" ] || dotfiles_mount=$CAYO_DOTFILES_MOUNT
+  CAYO_GUEST_DOTFILES=$dotfiles_mount exec "$bin/cayo-verify" "$profile" "$name" "$@"
+}
+
+# ---- Dispatch --------------------------------------------------------------------------------
+
+[ $# -ge 1 ] || usage
+command=$1; shift
 case $command in
-  new)      new_guest; guest_init ;;
-  rm)       remove_containers; docker volume rm "$home_volume" ;;
-  recreate) recreate_guest ;;
-  exec)     enter_guest "$@" ;;
-  port)     forward_port "$@" ;;
-  reload)   reload_proxy ;;
-  denied)   denied_hosts ;;
-  allow)    allow_hosts "$@" ;;
-  verify)   CAYO_GUEST_DOTFILES=$( [ -n "$(guest_dotfiles)" ] && echo "$CAYO_DOTFILES_MOUNT" || true ) \
-              exec "$bin/cayo-verify" "$profile" "$name" "$@" ;;
-  *)        usage ;;
+  vm)     vm_command "$@" ;;
+  build)  build_command ;;
+  new|rm|recreate|exec|port|reload|denied|allow|verify)
+    [ $# -ge 2 ] || usage
+    guest_context "$1" "$2"; shift 2
+    case $command in
+      new)      new_guest; guest_init ;;
+      rm)       remove_containers; docker volume rm "$home_volume" ;;
+      recreate) recreate_guest ;;
+      exec)     enter_guest "$@" ;;
+      port)     forward_port "$@" ;;
+      reload)   reload_proxy ;;
+      denied)   denied_hosts ;;
+      allow)    allow_hosts "$@" ;;
+      verify)   verify_guest "$@" ;;
+    esac ;;
+  *)      usage ;;
 esac

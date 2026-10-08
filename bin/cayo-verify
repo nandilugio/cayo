@@ -39,13 +39,22 @@ if [ -n "$dotfiles" ]; then
 fi
 
 # Everything else, from inside the guest.
-others=$(docker ps -a --format '{{.Names}}' | grep '^cayo-' | grep -v "^$guest" | tr '\n' ' ' || true)
+others=$(docker ps -a --format '{{.Names}}' | grep '^cayo-' \
+  | grep -v -E "^$guest(-proxy|-port-[0-9]+)?\$" | tr '\n' ' ' || true)  # not its own sidecars
 guest_checks() { cat <<'EOF'
 result() { if [ "$1" -eq 0 ]; then echo "ok    $2"; else echo "FAIL  $2"; fi; }
 quietly() { "$@" >/dev/null 2>&1; }
 # The proxy's answer, not just a failure: a network that blocks the host would also fail.
 connect_code() { curl -s -m 10 -o /dev/null -w '%{http_connect}' "$1"; }  # HTTPS, through CONNECT
 http_code() { curl -s -m 10 -o /dev/null -w '%{http_code}' "$1"; }
+# Whether the proxy let a URL through: the CONNECT succeeded (HTTPS), or a plain-HTTP answer came
+# from somewhere other than the proxy's refusal. What the site answers (a 404 to GET /) is not
+# the question.
+passed() {
+  case $(curl -s -m 15 -o /dev/null -w '%{http_connect} %{http_code}' "$1") in
+    "200 "*) return 0 ;; "000 000"|"000 403") return 1 ;; "000 "*) return 0 ;; *) return 1 ;;
+  esac
+}
 
 [ -z "$(find / \( -path /proc -o -path /sys \) -prune -o -type s \( -name docker.sock -o \
   -name containerd.sock -o -name podman.sock -o -name cri-dockerd.sock \) -print 2>/dev/null)" ]
@@ -65,10 +74,10 @@ case $PROFILE in
   trusted|public)
     [ "$(connect_code https://example.com)" = 403 ]; result $? "the proxy refuses a host off the allow-list"
     if [ -n "$ALLOWED" ]; then
-      quietly curl -fsS -m 15 -o /dev/null "$ALLOWED"; result $? "an allow-listed host works ($ALLOWED)"
+      passed "$ALLOWED"; result $? "the proxy lets an allow-listed URL through ($ALLOWED)"
     fi ;;
   hostile-web)
-    quietly curl -fsS -m 15 -o /dev/null https://example.org; result $? "the public internet works" ;;
+    passed https://example.org; result $? "the public internet works" ;;
 esac
 ! quietly getent hosts example.com; result $? "external names don't resolve in the guest"
 [ "$(http_code "http://$HOST_ADDRESS")" = 403 ]; result $? "the proxy refuses the host ($HOST_ADDRESS)"

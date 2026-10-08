@@ -7,12 +7,15 @@
 #CAYO_DOTFILES=~/.cayo/dotfiles
 #CAYO_DOTFILES_MOUNT=/home/cayo/.dotfiles
 
-# More host paths for the cayo VM, read-only, space-separated: the clean clones that a project's
-# compose file bind-mounts, for example. Restart the VM after changing it.
+# More host paths for the cayo VM, read-only, space-separated (so none may contain a space): the
+# clean clones that a project's compose file bind-mounts, for example. Restart the VM after
+# changing it.
 #CAYO_VM_MOUNTS="$HOME/src-clean"
-
-# The agent cayo-window starts.
-#CAYO_AGENT=opencode
 
 # Variables named CAYO_INIT_* are passed to ~/.cayo/guest-init, here or in the environment.
 #CAYO_INIT_GIT_NAME="Your Name"
+
+# Hosts a guest reaches directly instead of through its proxy, comma-separated: a project's HTTP
+# dev services (README.md, Dev services). It is per project, so it usually goes in the environment
+# of `cayo new`: CAYO_NO_PROXY=app-search cayo new trusted shop
+#CAYO_NO_PROXY=

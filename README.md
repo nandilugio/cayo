@@ -10,7 +10,7 @@ cayo allow trusted shop api.anthropic.com           # let it reach one more host
 cayo verify trusted shop https://api.anthropic.com  # check its isolation
 ```
 
-A *cayo* is a small island. **Status: early.** It runs on macOS with [colima](https://github.com/abiosoft/colima); Linux hosts should work the same way but are not checked yet. It started as the reference deployment of [penyero](https://github.com/nandilugio/penyero), a broker that mediates agents' access to production, and stands on its own: penyero is optional.
+A *cayo* is a small island. **Status: early.** It runs on macOS with [colima](https://github.com/abiosoft/colima); Linux hosts should work the same way but are not checked yet. Nothing in a guest is special: it runs the editor, the agent and the project; you drive it from your terminal with `cayo exec`. It started as the reference deployment of [penyero](https://github.com/nandilugio/penyero), a broker that mediates agents' access to production, and stands on its own: penyero is optional.
 
 ## Why
 
@@ -29,7 +29,7 @@ The framing is Meta's *Agents Rule of Two*, with Simon Willison's *lethal trifec
 | Profile | Meant for | VM | Gets | Egress |
 |---|---|---|---|---|
 | `trusted` | your own projects and vetted sources | `cayo` | your dotfiles, read-only | proxy, allow-list |
-| `public` | open-source work: public issues, PRs, the web | `cayo` | your dotfiles, read-only; no credentials | proxy, allow-list |
+| `public` | open-source work: public issues, PRs, the web | `cayo` | your dotfiles, read-only (and you put no credentials in it) | proxy, allow-list |
 | `hostile-web` | content that may target automated readers | `cayo-hostile` | nothing of yours | proxy, any public address; never the host or local network |
 | `hostile-sample` | samples, exploits, CTF material | `cayo-hostile` | nothing of yours | none at all |
 
@@ -39,14 +39,15 @@ What cayo doesn't do: decide which credentials a guest may hold (keep write cred
 
 ## Install
 
-Requirements: macOS with [colima](https://github.com/abiosoft/colima) (`brew install colima docker`); tmux for `cayo-window`.
+Requirements: macOS with [colima](https://github.com/abiosoft/colima) and the Docker CLI (`brew install colima docker`; `docker-compose`, as a CLI plugin, for dev services).
 
 ```sh
 git clone https://github.com/nandilugio/cayo ~/.local/share/cayo
-ln -s ~/.local/share/cayo/bin/cayo ~/.local/share/cayo/bin/cayo-window ~/.local/bin/
-mkdir -p ~/.cayo/egress
+ln -s ~/.local/share/cayo/bin/cayo ~/.local/bin/
 cayo vm start cayo
 ```
+
+`cayo new` creates what it needs under `~/.cayo` (a guest's allow-list starts empty, so its proxy refuses everything until you allow hosts); the rest of the configuration is optional.
 
 Install from a checkout you trust and don't let guests write to: the host runs these scripts with your privileges. If you develop cayo itself inside a guest, install from a clean clone at a reviewed commit, never from the guest's working copy.
 
@@ -64,8 +65,8 @@ The checkout holds the tool; `~/.cayo` holds yours. `examples/` has a template f
 ~/cayo-exchange/<vm>/<guest>/   exchange directories: guest-written, so kept out of ~/.cayo
 ```
 
-- **`config`**: `CAYO_DOTFILES` (a directory mounted read-only into `trusted` and `public` guests; default `~/.cayo/dotfiles`; may be a link to your dotfiles checkout), `CAYO_DOTFILES_MOUNT` (where guests see it; default `/home/cayo/.dotfiles`), `CAYO_VM_MOUNTS` (more host paths for the `cayo` VM, read-only), `CAYO_AGENT` (the agent `cayo-window` starts; default `opencode`), and any `CAYO_INIT_*` variables for `guest-init`.
-- **`guest-init`**: `cayo new` pipes it into the new guest's shell, so it runs inside the guest as its user, with `CAYO_PROFILE`, `CAYO_NAME` and every `CAYO_INIT_*` variable (from `config` or the environment: `CAYO_INIT_GIT_EMAIL=you@example.com cayo new trusted shop`). Use it to link your dotfiles into place, set a git identity, install a shell framework. `cayo recreate` doesn't run it again: the guest keeps its home.
+- **`config`**: `CAYO_DOTFILES` (a directory mounted read-only into `trusted` and `public` guests; default `~/.cayo/dotfiles`; may be a link to your dotfiles checkout; when it doesn't exist, guests get none and `cayo new` says so), `CAYO_DOTFILES_MOUNT` (where guests see it; default `/home/cayo/.dotfiles`), `CAYO_VM_MOUNTS` (more host paths for the `cayo` VM, read-only, space-separated), any `CAYO_INIT_*` variables for `guest-init`, and `CAYO_NO_PROXY` (hosts a guest reaches directly: its HTTP dev services; per project, so usually in the environment of `cayo new`).
+- **`guest-init`**: `cayo new` pipes it into the new guest's shell, so it runs inside the guest as its user, with `CAYO_PROFILE`, `CAYO_NAME` and every `CAYO_INIT_*` variable (from `config` or the environment: `CAYO_INIT_GIT_EMAIL=you@example.com cayo new trusted shop`). Use it to link your dotfiles into place, set a git identity, install a shell framework. It never runs in hostile guests, which get nothing of yours, and `cayo recreate` doesn't run it again: the guest keeps its home.
 - **`image/Dockerfile`**: `FROM cayo-base`, plus whatever installs outside the home (system packages, a client like penyero's). When it exists, cayo builds it as `cayo-local` and new guests use it.
 - **What to keep private.** The allow-lists, the overrides and the guest names all name your projects and the hosts you trust, so keep them local (they are in `~/.cayo`, not in the checkout). The rest (`config`, `guest-init`, `image/`) can live in a public dotfiles repository, as long as it holds no secrets.
 
@@ -87,10 +88,9 @@ cayo build                                  rebuild the guest image in each runn
                                             updated base and sidecar images
 cayo vm start|stop|delete <vm>              create or start a VM (cayo, cayo-hostile) with its
                                             mounts; stop it; delete it with all its data
-cayo-window <profile> <name>                a tmux window: editor, agent and shell in the guest
 ```
 
-Guest names can't contain `-`: cayo names a guest's network, volume and sidecars by appending to the container's name.
+Guest names are letters, digits, `.` and `_`: no `-`, since cayo names a guest's network, volume and sidecars by appending to the container's name.
 
 ## How it works
 
@@ -116,7 +116,7 @@ host                                          colima VM cayo (trusted, public gu
 - **Why VMs of its own.** A general-purpose runtime's VM usually sees your whole home (Docker Desktop shares `/Users` by default), and restricting it is a machine-wide setting other tools depend on. cayo's VMs see exactly their mounts, at the same paths, and nothing else. With colima's defaults on macOS (the `vz` VM type, virtiofs mounts), **the host enforces read-only**: checked on colima 0.10.3 (Lima 2.2.1), root inside the VM could neither write to a read-only mount, nor after remounting it read-write, nor after mounting the share again by its tag.
 - **Your default Docker context stays yours.** `cayo vm start` passes `--activate=false`, which the VM's profile remembers; the commands select a VM explicitly (`docker --context colima-cayo`).
 - **Changing mounts**: edit `config`, then `cayo vm stop cayo` and `cayo vm start cayo`. A running VM keeps the mounts it started with.
-- **Lifecycle.** VMs don't start by themselves after a reboot: `cayo vm start <vm>`. A VM's configuration is in `~/.colima/<vm>/`, its Docker data (images, and every guest's home volume: repos, the agent's login) in a sparse disk under `~/.colima/_lima/_disks/`, the downloaded VM image in `~/Library/Caches/colima`. `cayo vm stop` frees the VM's memory and keeps everything; `cayo vm delete` removes it after two confirmations, with `--data`: a plain `colima delete` keeps the data disk, and a VM created later with the same name gets it back, guests' volumes included. `cayo-hostile` is meant to be disposable: start it for a hostile task, delete it when its guests are gone.
+- **Lifecycle.** VMs don't start by themselves after a reboot: `cayo vm start <vm>`. A VM's configuration is in `~/.colima/<vm>/`, its Docker data (images, and every guest's home volume: repos, the agent's login) in a sparse disk under `~/.colima/_lima/_disks/`, the downloaded VM image in `~/Library/Caches/colima` (on macOS). `cayo vm stop` frees the VM's memory and keeps everything; `cayo vm delete` removes it after two confirmations, with `--data`: a plain `colima delete` keeps the data disk, and a VM created later with the same name gets it back, guests' volumes included. `cayo-hostile` is meant to be disposable: start it for a hostile task, delete it when its guests are gone.
 - **Never** give a guest the runtime's control socket, `privileged: true`, host networking, or the host PID namespace: any of these hands it its VM, and everything the VM mounts.
 
 ### Guests
@@ -133,7 +133,7 @@ host                                          colima VM cayo (trusted, public gu
 - **Repos live in the home volume**, not on the host. The volume survives the container, so a guest can be recreated from a new image without losing anything; it lives inside the VM, so it is fast; and the host can't accidentally run git or an editor against the repos (it reaches them through the `ext::` remote, below).
 - **The dotfiles are read-only**, and a change on the host reaches every guest at once. They must never contain secrets, and file modes don't help: a guest reads every file in a mount, whatever its permissions. Hostile guests get none.
 - **The exchange directory** is the one writable host path, for screenshots, CSVs and similar, per guest under its VM's exchange root (the hostile VM can't see the others'). On the host, treat its contents like untrusted downloads: a guest can create symlinks there that point at host paths, and a host tool that follows one reads or overwrites the host file. Don't write into it over existing names, and check with `ls -l` before opening what's there.
-- **Proxy variables** are set in both spellings, since tools disagree on which they read (curl ignores an uppercase `HTTP_PROXY`). `CAYO_NO_PROXY` adds HTTP dev services, which would otherwise be sent to the proxy and refused.
+- **Proxy variables** are set in both spellings, since tools disagree on which they read (curl ignores an uppercase `HTTP_PROXY`). `CAYO_NO_PROXY`, at `cayo new`, adds the hosts the guest reaches directly: its HTTP dev services, which would otherwise be sent to the proxy and refused.
 - **Ports, when a guest needs them.** Docker publishes no ports for a container that is only on an internal network, so `cayo port` starts a small forwarder per port, on the bridge and attached to the guest's network: `cayo port trusted shop 8000` makes the guest's port 8000 reachable at `127.0.0.1:8000`, `cayo port trusted shop 18000:5173` maps another host port. A clash within a VM is refused; one between the two VMs, or with a host process, goes unnoticed, and the host port leads to whichever claimed it first. Dev servers must listen on `0.0.0.0` inside the guest (Django's, for one, defaults to `127.0.0.1`). Forwarded ports are reachable from other containers in the VM through the host, so they shouldn't expose anything that trusts its callers.
 - **Updating.** `cayo build` rebuilds on a freshly pulled Debian base (security updates come with every rebuild), rebuilds your layer, pulls the proxy and forwarder images and drops unused images. Guests keep the image they were created from until `cayo recreate`, which replaces the guest's containers, keeps its home volume and its forwarded ports, and ends whatever runs in the guest at that moment.
 
@@ -165,7 +165,7 @@ Docker copies the image's home into a guest's volume only once, when the volume 
 
 ### Terminal
 
-Use a terminal that denies clipboard reads (Ghostty: `clipboard-read = deny`, `clipboard-write = allow`): guests set the clipboard through OSC 52, and the clipboard often holds secrets. With tmux, `set -g set-clipboard on`. `docker exec -it` allocates a terminal inside the guest; your pane only relays bytes, so no terminal device is shared with the guest. The terminal's `TERM` needs its terminfo in the image; `cayo new` sets `xterm-256color`.
+Use a terminal that denies clipboard reads (Ghostty: `clipboard-read = deny`, `clipboard-write = allow`): guests set the clipboard through OSC 52, and the clipboard often holds secrets. With tmux, `set -g set-clipboard on`; a window per guest with the editor, the agent and a shell is three `tmux split-window "cayo exec <profile> <name> …"` lines. `docker exec -it` allocates a terminal inside the guest; your pane only relays bytes, so no terminal device is shared with the guest. The terminal's `TERM` needs its terminfo in the image; `cayo new` sets `xterm-256color`.
 
 ### Editor, agent and browser
 
@@ -230,7 +230,7 @@ Deploying runs guest-written code with your privileges; the guarantee is that wh
 | Profile | Checks |
 |---|---|
 | all | not privileged; all capabilities dropped; `no-new-privileges`; own PID namespace; no runtime socket mounted or present; exactly the expected mounts |
-| `trusted`, `public` | dotfiles (when mounted) present, read-only, not writable; the proxy refuses a host off the allow-list with its own 403; `allowed-url`, if given, works |
+| `trusted`, `public` | dotfiles (when mounted) present, read-only, not writable; the proxy refuses a host off the allow-list with its own 403; `allowed-url`, if given, gets through the proxy (whatever the site answers) |
 | `trusted`, `public`, `hostile-web` | only on its internal network; external names don't resolve; the proxy refuses the host and a private address; no route to the host or the internet around the proxy; other guests' containers don't resolve |
 | `hostile-web` | the public internet works through the proxy |
 | `hostile-sample` | no network, no routes, no connection to the internet |

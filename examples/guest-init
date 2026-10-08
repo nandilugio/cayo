@@ -2,11 +2,8 @@
 # shell (sh). It runs as the guest's user, inside the guest: whatever it does stays there. It gets
 # CAYO_PROFILE, CAYO_NAME and every CAYO_INIT_* variable from ~/.cayo/config or the environment,
 # e.g. CAYO_INIT_GIT_EMAIL=you@example.com cayo new trusted shop. It is not run by `cayo recreate`,
-# which keeps the guest's home.
+# which keeps the guest's home, nor for hostile guests, which get nothing of yours.
 set -eu
-
-# Hostile guests get nothing of yours.
-case $CAYO_PROFILE in hostile-*) exit 0 ;; esac
 
 # Git identity, for commits made in the guest (pushes happen from the host, after review).
 if [ -n "${CAYO_INIT_GIT_NAME:-}" ]; then git config --global user.name "$CAYO_INIT_GIT_NAME"; fi
