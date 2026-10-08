@@ -59,7 +59,7 @@ case $PROFILE in
     [ -n "$(ls -A ~/.dotfiles)" ]; result $? "dotfiles present (an empty mount means the VM lacks it)"
     ! quietly touch ~/.dotfiles/.aiws-verify; result $? "dotfiles not writable"
     [ -z "$(find / \( -path /proc -o -path /sys \) -prune -o -type s -print 2>/dev/null \
-      | grep -v '/\.priviledge/relay\.sock$')" ]; result $? "no Unix sockets besides the relay's"
+      | grep -v '/\.penyero/relay\.sock$')" ]; result $? "no Unix sockets besides the relay's"
     [ "$(connect_code https://example.com)" = 403 ]; result $? "the proxy refuses a host off the allow-list"
     if [ -n "$ALLOWED" ]; then
       quietly curl -fsS -m 15 -o /dev/null "$ALLOWED"; result $? "an allow-listed host works ($ALLOWED)"

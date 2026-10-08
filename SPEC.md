@@ -1,15 +1,15 @@
-# priviledge — product specification (draft)
+# penyero — product specification (draft)
 
 Status: draft for discussion. Nothing here is implemented yet. Items marked **(verify)** are
 assumptions that must be checked on a real machine before they are relied upon.
 
-This document specifies **what** priviledge is and does: its purpose, security model, and the
+This document specifies **what** penyero is and does: its purpose, security model, and the
 interfaces the agent and the human use. Two other documents cover the rest:
 
 - [DESIGN.md](DESIGN.md): **how** it is built. Processes, protocol, technology, first iterations.
   It can change without changing this document.
 - [SETUP.md](SETUP.md): one reference deployment around it (container runtime, images, terminal,
-  editor, review tools, git remotes, egress). priviledge depends only on the deployment contract
+  editor, review tools, git remotes, egress). penyero depends only on the deployment contract
   in §4.
 
 ## 1. Problem
@@ -20,8 +20,8 @@ consoles on remote hosts, pushing code. The choice is roughly all-or-nothing: ei
 holds the credentials (and can do anything with them, unobserved), or the human runs every
 privileged command by hand and pastes the result back, which is slow and error-prone.
 
-priviledge mediates privileged operations: the agent requests, the human approves (or a rule
-does), priviledge executes with credentials the agent never sees, the human reviews the output,
+penyero mediates privileged operations: the agent requests, the human approves (or a rule
+does), penyero executes with credentials the agent never sees, the human reviews the output,
 and the result goes back to the agent.
 
 ## 2. Goals and non-goals
@@ -41,21 +41,21 @@ Goals:
 
 Non-goals:
 
-- **Protecting production from malicious code that passes code review.** priviledge protects the
+- **Protecting production from malicious code that passes code review.** penyero protects the
   developer's privileged context and mediates direct privileged actions. Code integrity is the job
   of review, CI, branch protection and deploy gates.
-- Automating browser-only surfaces (cloud consoles, dashboards, admin UIs). priviledge can
+- Automating browser-only surfaces (cloud consoles, dashboards, admin UIs). penyero can
   route such a task to the human instead (§8, human resources).
 - Network egress control. It is part of a guest's risk profile (§3) and the deployment provides
-  it (§4); priviledge may later act as its approval backend (§10).
+  it (§4); penyero may later act as its approval backend (§10).
 - A team or multi-user product.
 
 Principles, which every feature is weighed against:
 
-- **One job.** priviledge mediates privileged requests: approval, execution with credentials the
+- **One job.** penyero mediates privileged requests: approval, execution with credentials the
   agent never sees, output review, audit. Any other need is met by a separate tool that composes
   with it (the guest runtime, the egress proxy, the human's pager and editor, resource
-  executables), not by growing priviledge. A feature belongs inside only when it can't be done
+  executables), not by growing penyero. A feature belongs inside only when it can't be done
   well from outside.
 - **POSIX-style.** Processes, argv, stdin, stdout, stderr, exit statuses and files; text
   interfaces that compose with pipes.
@@ -78,9 +78,9 @@ Principles, which every feature is weighed against:
 - **Privileged side** (trusted): the human's own account on the host. It holds the secrets (cloud
   credentials, ssh keys, database credentials, OS keychain), runs the broker and its approval
   prompt, holds the credentials for pushing and deploying, and controls the guest runtime.
-- **Broker**: the part of priviledge on the privileged side. It receives requests, asks the human,
+- **Broker**: the part of penyero on the privileged side. It receives requests, asks the human,
   runs resources, and keeps the audit log. One broker serves one guest.
-- **Client**: the part of priviledge inside the guest, the commands the agent runs (§6).
+- **Client**: the part of penyero inside the guest, the commands the agent runs (§6).
 
 Why the human's tooling lives in the AI workspace: any tool that interprets project files can run
 project code. LSP servers load project configuration, `node_modules` plugins, and virtualenv
@@ -101,7 +101,7 @@ server, app or build scripts are. Anything that goes wrong inside the AI workspa
 The one deliberate exception is **reviewed code at a pinned commit**: deploying it, running a
 project's compose file from it, or using a script from it in a resource. That code was written in
 the AI workspace, so running it with privileges relies on code review, which is the first
-non-goal (§2), not on priviledge.
+non-goal (§2), not on penyero.
 
 ### The guest is the security principal
 
@@ -150,7 +150,7 @@ communication half, and the rule splits by the harm it prevents.
 
 - **A. Untrustworthy input**: text or code an attacker may have written. Public issue trackers,
   pull requests, arbitrary web pages, dependency sources, hostile samples.
-- **B. Sensitive reach**, through a credential in the guest or a priviledge resource it may
+- **B. Sensitive reach**, through a credential in the guest or a penyero resource it may
   request, in two halves:
   - **B-read**: reading private data or sensitive systems, private source included.
   - **B-write**: changing their state: pushes, PR comments, ticket edits, prod writes.
@@ -173,8 +173,8 @@ mounted credentials, egress policy). The reference set:
 
 | Profile | A: input | B-read | B-write | C: egress |
 |---|---|---|---|---|
-| `trusted` | The human's own projects and vetted sources | Resources; read-only ones may auto-approve and release unreviewed | Through priviledge, asked | Allow-list |
-| `public` | Open-source work: public issues, PRs, general web | Resources only, no credentials in the guest; every request and output asked | Through priviledge, asked | Allow-list |
+| `trusted` | The human's own projects and vetted sources | Resources; read-only ones may auto-approve and release unreviewed | Through penyero, asked | Allow-list |
+| `public` | Open-source work: public issues, PRs, general web | Resources only, no credentials in the guest; every request and output asked | Through penyero, asked | Allow-list |
 | `hostile-web` | Content that may target automated readers | **Nothing**: no credentials, no resources | Nothing | Broad to the internet, needed by the task; no host or local network |
 | `hostile-sample` | Samples, exploits, CTF material | Nothing | Nothing | **None** |
 
@@ -192,15 +192,15 @@ Three consequences worth stating:
   task needs broad egress, so the guest holds nothing worth taking; the host and the local network
   stay out of reach, since services there are something worth taking too. For samples, egress
   goes too. What A with C can still do is harm others (abuse sent from the guest), which, as in
-  Meta's rule, is out of priviledge's scope.
+  Meta's rule, is out of penyero's scope.
 
 The same project may need guests of different profiles: developing it in `trusted`, triaging its
 public tracker in `public`.
 
-### priviledge's own code
+### penyero's own code
 
 - The broker is installed from a privileged-owned source (for example a clean clone at a reviewed
-  tag). It must never run from a copy the AI workspace can write. This matters because priviledge
+  tag). It must never run from a copy the AI workspace can write. This matters because penyero
   itself will be developed in an AI workspace.
 - The client is untrusted like everything else in the guest. Its version and integrity don't
   matter: whatever runs there speaks for that guest by definition.
@@ -231,7 +231,7 @@ public tracker in `public`.
   route out of their own, since the guest can often run code in them) and, depending on the
   deployment, services listening on the host (see SETUP.md).
 - Escape from the guest through a runtime or kernel vulnerability. The strength of this boundary
-  is a deployment choice. One class deserves naming, because priviledge triggers it: running a
+  is a deployment choice. One class deserves naming, because penyero triggers it: running a
   program inside a hostile guest (contract item 2) is what container-escape flaws such as
   CVE-2019-5736 in runc exploited. Keep the runtime patched, and prefer runtimes that put a VM
   around each guest (see SETUP.md).
@@ -240,32 +240,32 @@ public tracker in `public`.
 
 ## 4. Deployment contract
 
-priviledge assumes the deployment guarantees the following. Everything else about the setup is
+penyero assumes the deployment guarantees the following. Everything else about the setup is
 free to change.
 
-1. **Separation.** The AI workspace cannot read or write the privileged side's secrets, priviledge's
+1. **Separation.** The AI workspace cannot read or write the privileged side's secrets, penyero's
    configuration, or its state.
 2. **A way to run a program inside a guest.** The privileged side has a command that starts a
    process inside a given guest with its stdin and stdout connected to the caller, for example
    `docker exec -i <name>`, `container exec -i <name>`, `ssh <host>`, or `sudo -u <user>`.
-   priviledge uses it to reach the guest (`guest_exec`, §8; DESIGN.md §3).
+   penyero uses it to reach the guest (`guest_exec`, §8; DESIGN.md §3).
 3. **No path back.** The guest has no way to act as the privileged side: no sudo to it, no
    credentials for it, no access to the guest runtime's control socket, no shared terminal
    device.
 4. **One guest per trust domain** (§3).
 5. **Profiles are real.** A guest of a given profile holds only the credentials its profile
    allows (§3), and its egress is restricted to what the profile allows, denied by default where
-   the profile says so. priviledge cannot check this; the deployment guarantees it.
+   the profile says so. penyero cannot check this; the deployment guarantees it.
 
 ## 5. Capability placement
 
 Every privileged capability is placed by one rule:
 
-> **Credentials define capability; priviledge rules define convenience.**
+> **Credentials define capability; penyero rules define convenience.**
 
 There are two ways to give the AI workspace a capability:
 
-- **A priviledge resource** (§8). The credential stays on the privileged side; the agent invokes it
+- **A penyero resource** (§8). The credential stays on the privileged side; the agent invokes it
   through the client. Each profile decides whether it asks or auto-approves, and whether the
   output is reviewed. Every use is audited.
 - **A native grant**: a token in the agent's own environment. Nothing stands between the agent
@@ -288,7 +288,7 @@ Initial placement (to be confirmed per service):
 
 | Capability | Placement | Notes |
 |---|---|---|
-| Git upstream read | Native, read-only token | git needs it non-interactively. A credential helper that requests it through priviledge makes it short-lived and audited per use (SETUP.md); it still enters the guest |
+| Git upstream read | Native, read-only token | git needs it non-interactively. A credential helper that requests it through penyero makes it short-lived and audited per use (SETUP.md); it still enters the guest |
 | Git push | Privileged side only | Feeds the deploy pipeline; never native, never a resource |
 | PR/CI read (code host) | Resource, read-only token, auto-approve eligible | |
 | Error tracker read | Resource, read-only token, auto-approve eligible | Errors may contain PII: condition 2 per profile |
@@ -307,36 +307,36 @@ host at all; the only control is whether the account has them.
 
 ## 6. Agent interface
 
-The client is one program, `priviledge`, used inside the guest. Every operation is asynchronous:
+The client is one program, `penyero`, used inside the guest. Every operation is asynchronous:
 a request is submitted, waited for, and retrieved, in three separate commands. Each command does
 one thing, so any of them can be composed with other tools without ambiguity.
 
-- `priviledge list`: the resources this guest may request.
-- `priviledge describe <resource>`: its description, what input it takes, its declared parameters,
+- `penyero list`: the resources this guest may request.
+- `penyero describe <resource>`: its description, what input it takes, its declared parameters,
   and whether it is auto-approved for this guest.
-- `priviledge request <resource> -r <reason> [-p key=value]... [-- args...] [< payload]`: submit a
+- `penyero request <resource> -r <reason> [-p key=value]... [-- args...] [< payload]`: submit a
   request. Prints the request id on stdout and exits at once.
-- `priviledge wait <id>... [--timeout <seconds>]`: block until every listed request is settled (its
+- `penyero wait <id>... [--timeout <seconds>]`: block until every listed request is settled (its
   result is ready, it failed, was denied, or was dropped). Prints nothing on stdout. Without
   `--timeout` it waits indefinitely. It exits 0 once all are settled; `retrieve` then tells each
   outcome.
-- `priviledge retrieve <id>`: write the result to stdout. Never blocks: if the request is not
+- `penyero retrieve <id>`: write the result to stdout. Never blocks: if the request is not
   settled, it exits with a distinct status.
-- `priviledge pending`: this guest's requests not yet retrieved, with resource and state.
-- `priviledge cancel <id>`: withdraw a request that has not started (waiting for approval or for
+- `penyero pending`: this guest's requests not yet retrieved, with resource and state.
+- `penyero cancel <id>`: withdraw a request that has not started (waiting for approval or for
   a free slot of its resource, §8). It is discarded.
 
 ```sh
-id=$(priviledge request prod-db-ro -r "count overdue orders by region" <<'SQL'
+id=$(penyero request prod-db-ro -r "count overdue orders by region" <<'SQL'
 SELECT region, count(*) FROM orders WHERE status = 'open' GROUP BY region
 SQL
 )
-priviledge wait "$id" --timeout 100
-priviledge retrieve "$id" > counts.csv
+penyero wait "$id" --timeout 100
+penyero retrieve "$id" > counts.csv
 
-a=$(priviledge request aws-readonly -r "find restarts" -- logs filter-log-events ...)
-b=$(priviledge request prod-db-ro -r "recent refunds" < refunds.sql)
-priviledge wait "$a" "$b" && priviledge retrieve "$a" | jq ... && priviledge retrieve "$b"
+a=$(penyero request aws-readonly -r "find restarts" -- logs filter-log-events ...)
+b=$(penyero request prod-db-ro -r "recent refunds" < refunds.sql)
+penyero wait "$a" "$b" && penyero retrieve "$a" | jq ... && penyero retrieve "$b"
 ```
 
 - `-r <reason>` is required. It is shown to the human and written to the audit log.
@@ -382,7 +382,7 @@ client's own codes cannot collide with theirs:
 | 254 | Broker not connected | all | Retry once it is back |
 
 Codes 248–254 are outside the ranges ordinary tools and shells use. Every non-zero exit comes
-with a one-line `priviledge: ...` message on stderr.
+with a one-line `penyero: ...` message on stderr.
 
 **When the broker connection is lost** (guest restarted, broker stopped):
 
@@ -399,7 +399,7 @@ with a one-line `priviledge: ...` message on stderr.
 ## 7. Approval
 
 Each guest has its own approval prompt, on the terminal where the human runs
-`priviledge serve <profile> <name>`. The prompt is line-oriented, like `git add -p`. Layouts and
+`penyero serve <profile> <name>`. The prompt is line-oriented, like `git add -p`. Layouts and
 wording in this section are examples; the behaviour is what is specified.
 
 ```
@@ -508,10 +508,10 @@ review is itself a risk, because that is where a sneaked-in change gets past a t
 Comfortable review and small attack surface pull in opposite directions, and the rule that
 settles it:
 
-> priviledge itself renders untrusted content only as escaped plain text, with the standard
+> penyero itself renders untrusted content only as escaped plain text, with the standard
 > library and no parser. Any richer view (syntax colour, diffing, folding) is delegated to an
 > external tool the human chooses, which works on a privileged-owned *copy* of the content and
-> must never execute anything from it. priviledge's own surface stays small and auditable; the
+> must never execute anything from it. penyero's own surface stays small and auditable; the
 > richer tool's surface is the human's explicit choice.
 
 For those external tools: no LSP, ever (LSP servers execute project code); syntax highlighting is
@@ -523,8 +523,8 @@ The same rule applies to checkers (§10): external executables, not in-process p
 
 ### Configuration file
 
-`~/.priviledge/config.toml` (privileged-owned, mode 0600). Everything that defines the human's
-privileged capabilities lives under `~/.priviledge` (mode 0700): the configuration, the resource
+`~/.penyero/config.toml` (privileged-owned, mode 0600). Everything that defines the human's
+privileged capabilities lives under `~/.penyero` (mode 0700): the configuration, the resource
 executables by convention, and the audit logs (§9). One tree to protect, inspect and back up, as
 with `~/.ssh`. The broker refuses to start if the config file or any resource's `run`
 executable, or any directory above either of them up to the home directory, is group- or
@@ -535,23 +535,23 @@ no shell is involved.
 
 The file declares **resources** (what exists) and **profiles** (who may use what, with how much
 confirmation). Guests are not in the file: a guest is an instance of a profile, created by the
-deployment and named when the broker starts (`priviledge serve <profile> <name>`).
+deployment and named when the broker starts (`penyero serve <profile> <name>`).
 
 ```toml
 [review]                   # the pager and editor for `view` and `edit` (§7)
 pager = ["less", "-+r", "-+R", "--no-lessopen"]
-editor = ["nvim", "--clean", "-u", "~/.priviledge/review.lua"]
+editor = ["nvim", "--clean", "-u", "~/.penyero/review.lua"]
 
 [resources.prod-db-ro]
 description = "Production Postgres (read-only role). Bound queries on large tables by time."
-run = "~/.priviledge/resources/prod-db-ro"
+run = "~/.penyero/resources/prod-db-ro"
 input = "stdin"            # takes a payload: the SQL
 input_syntax = "sql"
 output_syntax = "csv"
 
 [resources.prod-db-rw]
 description = "Production Postgres (read-write role)."
-run = "~/.priviledge/resources/prod-db-rw"
+run = "~/.penyero/resources/prod-db-rw"
 input = "stdin"
 input_syntax = "sql"
 output_syntax = "csv"
@@ -559,13 +559,13 @@ write_credential = true
 
 [resources.aws-readonly]
 description = "AWS CLI with the read-only role. Pass the aws arguments after --."
-run = "~/.priviledge/resources/aws-readonly"
+run = "~/.penyero/resources/aws-readonly"
 args = true
 output_syntax = "json"
 
 [resources.ask-human]
 description = "A task for the human: a dashboard query, a value off a console, a question. Payload: the task."
-run = "~/.priviledge/resources/ask-human"   # echoes the task back (§8, human resources)
+run = "~/.penyero/resources/ask-human"   # echoes the task back (§8, human resources)
 input = "stdin"
 
 [profiles.trusted]
@@ -605,7 +605,7 @@ The broker validates at start:
 
 | Field | Meaning |
 |---|---|
-| `guest_exec` | The command that runs a program inside a guest (§4, item 2), as an argv list with `{profile}` and `{name}` substituted; priviledge appends its own program name and arguments. Required for a profile with resources |
+| `guest_exec` | The command that runs a program inside a guest (§4, item 2), as an argv list with `{profile}` and `{name}` substituted; penyero appends its own program name and arguments. Required for a profile with resources |
 | `notify` | `"bell"`, `"none"`, or an argv list, run when the pane goes from idle to having a prompt (§7). Default `"bell"` |
 | `resources.<resource>` | Makes the resource available to guests of this profile. Keys: `confirm_request` (approve before running), `confirm_output` (approve before releasing the output); both default `true` |
 
@@ -641,18 +641,18 @@ A resource has one audience on each side, and the broker keeps them apart:
   refused to prod-db-3.internal").
 
 Resource executables are therefore wrappers written for this contract, not stock tools exposed
-directly. They may be shared, and priviledge may ship some, but each one is the human's choice.
+directly. They may be shared, and penyero may ship some, but each one is the human's choice.
 
 ### Resource executables
 
 A resource is an executable owned by the privileged user. It is executed directly (never
-through `sh -c`). It receives the payload on stdin, declared parameters as `PRIVILEDGE_P_<NAME>`
+through `sh -c`). It receives the payload on stdin, declared parameters as `PENYERO_P_<NAME>`
 environment variables, and, if `args = true`, the extra arguments as argv. The agent cannot set
 any other part of its environment. It fetches its own secrets with whatever the OS provides (macOS
 `security`, Linux `secret-tool`, `pass`, `op read`, ...).
 
 **The environment is fixed, not inherited.** A resource gets `PATH`, `HOME`, `USER`, the locale
-variables and its `PRIVILEDGE_P_*` parameters, and nothing else from the shell that started
+variables and its `PENYERO_P_*` parameters, and nothing else from the shell that started
 `serve`. Many tools let the environment choose their credential and configuration (for the AWS
 CLI, variables like `AWS_ACCESS_KEY_ID` override its credentials file; libpq reads `PG*`
 variables), so an admin key exported there for some unrelated task would otherwise reach every
@@ -730,10 +730,10 @@ Long-lived interactive processes: psql, a Django shell reached through a cloud e
 remote ssh shell. Essential in practice (slow start-up, loaded state, interactive auth at start).
 Each approved snippet runs in the same live session and returns its output.
 
-priviledge doesn't hold sessions. A separate **session holder** keeps the process alive, in its
+penyero doesn't hold sessions. A separate **session holder** keeps the process alive, in its
 own terminal where the human completes any interactive authentication, and a resource executable
 sends it each approved snippet and returns the output. The resource's `concurrency = 1` keeps
-the session serial. A holder may ship with priviledge as a separate tool (§10). The same three
+the session serial. A holder may ship with penyero as a separate tool (§10). The same three
 properties apply: a local psql session would have to be confined, while a remote console runs its
 input remotely. Until a holder exists, the same work is done with repeated requests (each query
 is one request), which is slower but simple and safe.
@@ -775,10 +775,10 @@ document may still change, `1.0` when they stop.
    credential injected on the privileged side, and JSON review hints. Most SaaS reads,
    declaratively; the fixed base URL satisfies the credential rules by construction. To be
    weighed against the principles (§2) when picked: a wrapper executable can do the same.
-7. **An MCP adapter for the client's own commands** (`priviledge mcp`), only if a client needs
+7. **An MCP adapter for the client's own commands** (`penyero mcp`), only if a client needs
    it and it shows value over its cost. The CLI is POSIX-composable, works in every agent, and
    keeps the surface small and free of MCP spec churn.
-8. **Egress approval**: the deployment's egress proxy asks priviledge before allowing a new host,
+8. **Egress approval**: the deployment's egress proxy asks penyero before allowing a new host,
    so the human approves domains the way they approve requests. It needs a way for the proxy to
    reach the broker, which listens on nothing today.
 

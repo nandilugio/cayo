@@ -17,7 +17,7 @@ RUN arch=$(uname -m | sed 's/aarch64/arm64/') \
     && curl -fsSL "https://github.com/neovim/neovim/releases/download/$NVIM_VERSION/nvim-linux-$arch.tar.gz" \
       | tar -xz -C /usr/local --strip-components=1
 
-# The priviledge client and relay will be installed here too, system-wide, once they exist.
+# The penyero client and relay will be installed here too, system-wide, once they exist.
 
 RUN useradd -m -s /bin/zsh aiws && mkdir /home/aiws/src && chown aiws /home/aiws/src
 USER aiws

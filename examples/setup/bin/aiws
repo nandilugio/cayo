@@ -15,7 +15,7 @@
 #                                               updated base and sidecar images
 #   aiws vm start|stop|delete <vm>              create or start a VM (aiws, aiws-hostile) with its
 #                                               mounts; stop it; delete it with all its data
-# Profiles are the ones in priviledge's configuration (SPEC.md §8). Here each one is a container
+# Profiles are the ones in penyero's configuration (SPEC.md §8). Here each one is a container
 # shape: which VM it runs in, what is mounted, and how it reaches the network.
 set -eu
 

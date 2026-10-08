@@ -1,8 +1,8 @@
-# priviledge — reference setup (draft)
+# penyero — reference setup (draft)
 
-Status: draft. This describes **one** way to deploy the AI workspace around priviledge: Docker
-containers in dedicated colima VMs on macOS. priviledge itself does not depend on it; it only
-needs the deployment contract in [SPEC.md §4](SPEC.md#4-deployment-contract); how priviledge
+Status: draft. This describes **one** way to deploy the AI workspace around penyero: Docker
+containers in dedicated colima VMs on macOS. penyero itself does not depend on it; it only
+needs the deployment contract in [SPEC.md §4](SPEC.md#4-deployment-contract); how penyero
 reaches a guest is in [DESIGN.md §3](DESIGN.md#3-channel-and-relay). Other setups are sketched in
 §14. Items marked **(verify)** must be checked on the real machine. Every command here changes
 the machine's configuration, so the human reviews and runs it.
@@ -17,8 +17,8 @@ host: privileged side                         colima VM aiws (trusted, public gu
 ┌─────────────────────────────────────────┐   ┌──────────────────────────────────┐
 │ terminal + tmux                         │   │ guest aiws-trusted-shop          │
 │   panes: aiws exec … (docker exec -it)  │──▶│   nvim + LSP, agent, tests,      │
-│   pane:  priviledge serve trusted shop  │──▶│   dev servers, priviledge relay  │
-│ secrets, priviledge config              │   │   repos in a volume              │
+│   pane:  penyero serve trusted shop     │──▶│   dev servers, penyero relay     │
+│ secrets, penyero config                 │   │   repos in a volume              │
 │ the setup's files (~/.aiws)             │   │   dotfiles mounted read-only     │
 │ clean clones (review, push, deploy)     │   ├──────────────────────────────────┤
 │ docker CLI, colima (runtime control)    │   │ egress proxy, port forwarders    │
@@ -29,7 +29,7 @@ host: privileged side                         colima VM aiws (trusted, public gu
 
 - A **guest** is a container created on demand from a **profile** (SPEC.md §3): the profile decides
   the VM it runs in, what is mounted, and the egress policy. `aiws new trusted shop` creates
-  `aiws-trusted-shop`; `priviledge serve trusted shop` brokers for it.
+  `aiws-trusted-shop`; `penyero serve trusted shop` brokers for it.
 - One guest per project and profile, i.e. per trust domain. Many sessions (nvim, several agents,
   shells) run inside the same guest.
 - Guests run in **VMs of their own** (§2), not in the machine's general container runtime, so the
@@ -42,11 +42,11 @@ host: privileged side                         colima VM aiws (trusted, public gu
   a guest except reviewed code at a pinned commit (§11, §12).
 
 **Files.** The scripts and configuration of this setup are in the repository's
-`examples/setup/`, tested as described in §15. They are an example, not part of priviledge: copy
+`examples/setup/`, tested as described in §15. They are an example, not part of penyero: copy
 the directory to `~/.aiws` and make it yours. From then on it doesn't follow the repository, and
-nothing here is supported beyond being an example. priviledge's own files live in `~/.priviledge`
+nothing here is supported beyond being an example. penyero's own files live in `~/.penyero`
 (SPEC.md §8), separate because only those matter to the broker; another deployment has no
-`~/.aiws` at all. Copy from a checkout you trust; for priviledge's own development that means a
+`~/.aiws` at all. Copy from a checkout you trust; for penyero's own development that means a
 clean clone at a reviewed commit (§11), never a guest's working copy.
 
 ```
@@ -111,7 +111,7 @@ it. Any other `aiws` command whose VM isn't running stops and names the command 
 
 ## 3. Profiles
 
-Each profile in priviledge's configuration (SPEC.md §8) is implemented here as a guest shape. The
+Each profile in penyero's configuration (SPEC.md §8) is implemented here as a guest shape. The
 reference set:
 
 | Profile | VM | Mounted | Native tokens | Egress (§5) |
@@ -154,7 +154,7 @@ aiws vm start|stop|delete <vm>              create or start a VM (aiws, aiws-hos
 `aiws new` picks the VM from the profile, creates the home volume and the exchange directory,
 for a guest with a network an internal network and its proxy (§5), and runs the container with
 no capabilities, no privilege escalation, and nothing but `sleep` until something execs into it.
-Guest names can't contain `-`, although priviledge accepts it (DESIGN.md §2): the helper names a
+Guest names can't contain `-`, although penyero accepts it (DESIGN.md §2): the helper names a
 guest's network, volume and sidecars by appending to the container's name, and a guest named
 `shop-proxy` would collide with the proxy of a guest named `shop`.
 
@@ -249,7 +249,7 @@ Notes:
   (the guest holds a placeholder token, the proxy swaps in the real one at egress, so git's native
   token, SPEC.md §5, never enters the guest), at the cost of terminating TLS: every client in the
   guest must trust its CA.
-- Reviewing denied hosts is how allow-lists grow. Approval of new hosts through priviledge, as a
+- Reviewing denied hosts is how allow-lists grow. Approval of new hosts through penyero, as a
   prompt in the approval pane, is in the backlog (SPEC.md §10).
 - Start lists as empty as the work allows. An allowed host that stores data for any account can
   carry data out (SPEC.md §3), and in `trusted` the list also decides what strangers' text the
@@ -271,7 +271,7 @@ makes (Debian packages, the nvim release from GitHub) never need to be in a gues
 - **What goes in the image and what goes in the home** follows from one fact: Docker copies the
   image's `/home/aiws` into the volume only once, when the volume is created, so anything the
   image installs under the home never updates afterwards. Tools that install system-wide (system
-  packages, nvim, priviledge) therefore live in the image, rebuilt from the privileged side. Tools
+  packages, nvim, penyero) therefore live in the image, rebuilt from the privileged side. Tools
   that install into the home (nvim's plugins, language toolchains, the agent and its self-updater)
   are installed from inside the guest, through its proxy. Baking a project's toolchain into a
   per-project image (`FROM aiws-base`) is the reproducible option once it settles.
@@ -283,7 +283,7 @@ makes (Debian packages, the nvim release from GitHub) never need to be in a gues
   containers and keeps its home volume and its forwarded ports (checked: a file in the home and
   two forwarded ports survived a recreate onto a rebuilt image). Whatever runs in the guest at
   that moment, agents and editors included, ends.
-- priviledge is one program (DESIGN.md §1), installed the same way everywhere; in the guest only
+- penyero is one program (DESIGN.md §1), installed the same way everywhere; in the guest only
   its client and relay subcommands are used. It must be on the default `PATH`, since `guest_exec`
   runs it without a login shell. Its integrity in the guest doesn't matter (SPEC.md §3): it only
   has to speak a protocol version the broker accepts (DESIGN.md §4). The broker's copy is what
@@ -311,7 +311,7 @@ set -g bell-action other
 ```
 
 A per-guest window, `aiws-window <profile> <name>`: the editor, the agent and a shell in the guest
-(`aiws exec`), and the guest's approval pane, `priviledge serve <profile> <name>` under `dtach`.
+(`aiws exec`), and the guest's approval pane, `penyero serve <profile> <name>` under `dtach`.
 
 - **The approval pane in more than one window.** tmux can't show one pane in two windows, so the
   broker runs under `dtach`, which multiplexes its terminal: a second window attaches to the same
@@ -323,7 +323,7 @@ A per-guest window, `aiws-window <profile> <name>`: the editor, the agent and a 
 
 - `docker exec -it` allocates a terminal inside the guest. The privileged pane only relays bytes,
   so no terminal device is shared with the guest. What remains is escape sequences in guest
-  output, which is why clipboard reads are denied and priviledge escapes agent text.
+  output, which is why clipboard reads are denied and penyero escapes agent text.
 - The terminal's `TERM` (`xterm-ghostty`, say) needs its terminfo in the image. Either
   install it or use `xterm-256color`, which `aiws new` sets.
 - A privileged window holds a shell in the clean clones (§11) for review, push, deploy and project
@@ -335,7 +335,7 @@ The approval prompt shows escaped plain text; any richer view comes from the pag
 human configures (SPEC.md §7). They run as the privileged user over agent-authored content, so the
 choice matters:
 
-- They are the `[review]` argv lists in `~/.priviledge/config.toml`, run without a shell and with
+- They are the `[review]` argv lists in `~/.penyero/config.toml`, run without a shell and with
   a fixed environment, so an exported `LESS=-R` (escape sequences passed to the terminal) or
   `LESSOPEN` (a lesspipe script running other programs over the file) never reaches them.
   Tool-specific settings go in the list itself, e.g. `["env", "LESSHISTFILE=-", "less", ...]`.
@@ -353,11 +353,11 @@ choice matters:
 
   ```toml
   [review]
-  editor = ["vim", "-u", "~/.priviledge/review.vim", "-i", "NONE", "--noplugin"]
+  editor = ["vim", "-u", "~/.penyero/review.vim", "-i", "NONE", "--noplugin"]
   ```
 
   ```vim
-  " ~/.priviledge/review.vim
+  " ~/.penyero/review.vim
   set nocompatible
   set runtimepath=$VIMRUNTIME packpath=
   set nomodeline noswapfile noundofile viminfo=
@@ -367,12 +367,12 @@ choice matters:
 
   ```toml
   [review]
-  pager = ["nvim", "--clean", "-u", "~/.priviledge/review.lua", "-R"]
-  editor = ["nvim", "--clean", "-u", "~/.priviledge/review.lua"]
+  pager = ["nvim", "--clean", "-u", "~/.penyero/review.lua", "-R"]
+  editor = ["nvim", "--clean", "-u", "~/.penyero/review.lua"]
   ```
 
   ```lua
-  -- ~/.priviledge/review.lua
+  -- ~/.penyero/review.lua
   vim.o.modeline = false   -- the content must not set options
   vim.o.swapfile = false   -- no copy of the reviewed content (unredacted output, say)
   vim.o.undofile = false   --   outlives the review
@@ -384,19 +384,19 @@ choice matters:
   configuration or data directories is, a modeline in the content is ignored, and bundled syntax
   colouring works. No plugin, no LSP, no treesitter parser beyond the few nvim bundles.
 - Answering a human resource (SPEC.md §8) is an edit of its output in the same editor.
-- Diff review before a push (§11) is the human's own tooling, outside priviledge, under the same
+- Diff review before a push (§11) is the human's own tooling, outside penyero, under the same
   rule: no tool that runs project code.
 
 ## 9. Resources (privileged side)
 
 Resource executables are the human's, written to the contract and the three properties in
 SPEC.md §8. The repository will carry complete, tested examples under `examples/resources/`, to
-copy into `~/.priviledge/resources/` and adapt; the two below are for the resources in
+copy into `~/.penyero/resources/` and adapt; the two below are for the resources in
 SPEC.md's example configuration.
 
 ```sh
 #!/bin/sh
-# ~/.priviledge/resources/aws-readonly
+# ~/.penyero/resources/aws-readonly
 # Only allow-listed operations; global options go after them. No host files, no other endpoint.
 case "$1 $2" in
   "logs filter-log-events"|"logs describe-log-groups"|"ecs describe-services") ;;
@@ -409,25 +409,25 @@ for a in "$@"; do
 done
 # Only this profile's files. The broker's fixed environment (SPEC.md §8) keeps any AWS_* the
 # human exported out of here.
-AWS_CONFIG_FILE="$HOME/.priviledge/aws/readonly.config" \
-AWS_SHARED_CREDENTIALS_FILE="$HOME/.priviledge/aws/readonly.credentials" \
+AWS_CONFIG_FILE="$HOME/.penyero/aws/readonly.config" \
+AWS_SHARED_CREDENTIALS_FILE="$HOME/.penyero/aws/readonly.credentials" \
   exec aws "$@"
 ```
 
 ```sh
 #!/bin/sh
-# ~/.priviledge/resources/prod-db-ro
+# ~/.penyero/resources/prod-db-ro
 # `sqlquery` is the human's driver-based script: one SQL statement in on stdin, sent with the
 # extended query protocol (which refuses a second one, so a SET can't lift the timeout), CSV
 # out, and the driver's own errors on stderr, for the human.
 PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
-  exec "$HOME/.priviledge/bin/sqlquery" \
+  exec "$HOME/.penyero/bin/sqlquery" \
   "host=... user=app_ro dbname=... options='-c statement_timeout=60s'"
 ```
 
 - `sqlquery` is a single-file Python script run by uv, with its database driver pinned inline
   (`#!/usr/bin/env -S uv run --script`): the standard library has no Postgres driver, and the
-  dependency belongs to this resource, not to priviledge. It reads one statement from stdin, sends
+  dependency belongs to this resource, not to penyero. It reads one statement from stdin, sends
   it as a prepared statement (the extended query protocol, which refuses a second statement, so a
   `SET` can't lift the timeout), writes CSV to stdout, forwards the server's own error message to
   stdout (a syntax error or an unknown column is useful to the agent and names no host), and keeps
@@ -446,14 +446,14 @@ PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
   typescript-language-server, lua_ls, and so on. The plugin manager and mason.nvim install into the
   home volume.
 - The example uses opencode, which is open source. Any agent that runs shell commands works the
-  same way, since it reaches priviledge only through the client's commands (SPEC.md §6); several
+  same way, since it reaches penyero only through the client's commands (SPEC.md §6); several
   agents can share one guest.
 - The agent runs in the guest, logged in there, with its state in the home volume. That login is
   a credential in the guest (SPEC.md §3, known issue); for `public` and `hostile-*` guests, prefer
   an API key from a separate account with a spending limit. Its global instructions file is linked
   from the read-only dotfiles, so the source stays intact on the host; the agent could still replace
   the link in its own home, and instructions are not a security control (SPEC.md §3). Its permission
-  settings should let the `priviledge` commands (SPEC.md §6) run without asking: they are how the
+  settings should let the `penyero` commands (SPEC.md §6) run without asking: they are how the
   agent asks, and the human answers in the approval pane, not in the agent's.
 - Browser automation (Playwright and similar) runs inside the guest as well. Chromium's own
   sandbox may not start with all capabilities dropped; Playwright then needs Chromium's
@@ -473,7 +473,7 @@ PGPASSWORD="$(security find-generic-password -s prod-db-ro -w)" \
   account's rights are restricted server-side.
 - The git read-only token (SPEC.md §5) is the only native token, in a `trusted` guest's git
   credential store. Other read-only access (code host, error tracker, issue tracker) goes through
-  priviledge resources.
+  penyero resources.
 - Per-path tool state (the agent's per-project memory, `mise trust`, `direnv allow`) initialises
   fresh in the guest. Existing checkouts are not migrated; clone fresh.
 
@@ -504,17 +504,17 @@ git config transfer.fsckObjects true
 - A `public` guest of the same project gets its own remote (`aiws-public`).
 
 **Short-lived fetch tokens (optional).** Instead of a stored token, a git credential helper in the
-guest asks priviledge for one on each use. A `git-token` resource mints a short-lived, read-only
+guest asks penyero for one on each use. A `git-token` resource mints a short-lived, read-only
 token (for example a one-hour app installation token) and prints it in git's credential format;
 auto-approved and released unreviewed in `trusted`. The token still enters the guest (SPEC.md
 §5), but it expires, and every use is in the audit log. **(verify)**
 
 ```sh
 #!/bin/sh
-# ~/.local/bin/git-credential-priviledge, in the guest: git config credential.helper priviledge
+# ~/.local/bin/git-credential-penyero, in the guest: git config credential.helper penyero
 [ "$1" = get ] || exit 0
-id=$(priviledge request git-token -r "git credential for a fetch" </dev/null) &&
-  priviledge wait "$id" && exec priviledge retrieve "$id"
+id=$(penyero request git-token -r "git credential for a fetch" </dev/null) &&
+  penyero wait "$id" && exec penyero retrieve "$id"
 ```
 
 **Two-pass review:**
@@ -590,7 +590,7 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
   addresses (§5), but the proxies and forwarders are. Anything the privileged side runs on
   localhost, and every forwarded port, is reachable from those, and from pages the browser renders
   from a guest (§12). Audit with `lsof -nP -iTCP -sTCP:LISTEN` and make sure nothing sensitive
-  listens without authentication. priviledge itself listens on nothing.
+  listens without authentication. penyero itself listens on nothing.
 - **What colima forwards to the host.** Ports the VM listens on are forwarded to the host: those on
   the VM's `127.0.0.1` to the host's loopback, those on `0.0.0.0` to all the host's interfaces,
   the local network included (colima's default, matching Docker's meaning of `-p 8000:8000`).
@@ -607,7 +607,7 @@ SPEC.md §3: the guarantee is that what runs is exactly what was reviewed.
 
 ## 14. Other setups
 
-The same priviledge configuration works with a different `guest_exec` template per profile:
+The same penyero configuration works with a different `guest_exec` template per profile:
 
 | Setup | `guest_exec` | Notes |
 |---|---|---|
@@ -665,5 +665,5 @@ negative run: an `allowed-url` that is off the list fails. The rest is manual:
 - Dev-service containers have no route out: `docker --context colima-aiws compose exec` into one
   and try an external address and `192.168.5.2`.
 - Loopback listeners on the host (`lsof -nP -iTCP -sTCP:LISTEN`) are known and acceptable (§13).
-- Once the core loop exists: `priviledge list` shows only this profile's resources, and stopping
-  the guest's `priviledge serve` makes `request` fail fast.
+- Once the core loop exists: `penyero list` shows only this profile's resources, and stopping
+  the guest's `penyero serve` makes `request` fail fast.

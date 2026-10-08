@@ -1,15 +1,15 @@
-# priviledge — design (draft)
+# penyero — design (draft)
 
 Status: draft proposal. Nothing here is implemented yet. Items marked **(verify)** are assumptions
 that must be checked on a real machine before they are relied upon.
 
-This document describes **how** priviledge is built to meet [SPEC.md](SPEC.md). The spec is the
+This document describes **how** penyero is built to meet [SPEC.md](SPEC.md). The spec is the
 contract; anything here can change as long as the spec still holds. Terms (AI workspace, guest,
 profile, privileged side, broker, client) are as defined in [SPEC.md §3](SPEC.md#3-threat-model).
 
 ## 1. Processes
 
-One program, `priviledge`, with subcommands:
+One program, `penyero`, with subcommands:
 
 | Subcommand | Runs on | Role |
 |---|---|---|
@@ -82,7 +82,7 @@ lapse.
 
 Resources run as child processes of the broker, in their own session without a controlling
 terminal, with stdin, stdout and stderr connected to the request, and with the fixed environment
-of SPEC.md §8 (`PATH`, `HOME`, `USER`, `LANG`/`LC_*`, `PRIVILEDGE_P_*`) built from scratch rather
+of SPEC.md §8 (`PATH`, `HOME`, `USER`, `LANG`/`LC_*`, `PENYERO_P_*`) built from scratch rather
 than filtered. They can't prompt on, or write to, the approval pane. The broker collects stdout as
 the result and stderr for the pane and the log (SPEC.md §8, the resource contract), both spooled
 (§5), so the running view (SPEC.md §7) can show a snapshot of either at any time.
@@ -109,11 +109,11 @@ request (exit 253).
 ```
 privileged side                               guest trusted/shop
 ┌──────────────┐  guest_exec                  ┌──────────────────────────────┐
-│ priviledge   │  (docker exec -i             │ priviledge relay             │
+│ penyero      │  (docker exec -i             │ penyero relay                │
 │ serve        │   aiws-trusted-shop          │   listens on a Unix socket   │
-│ trusted shop │ ────── priviledge relay) ──▶ │   in the guest               │
+│ trusted shop │ ────── penyero relay) ─────▶ │   in the guest               │
 │              │ ◀───── stdin/stdout ───────▶ │                          ▲   │
-└──────────────┘                              │ priviledge request ... ──┘   │
+└──────────────┘                              │ penyero request ... ─────┘   │
                                               └──────────────────────────────┘
 ```
 
@@ -126,7 +126,7 @@ the other end because it chose the destination. This meets SPEC.md §3's identit
 no secrets and no host listener. Replacing the relay binary gains a guest nothing: whatever speaks
 on this guest's channel *is* this guest.
 
-- On start, the broker runs the resolved `guest_exec` followed by `priviledge relay`, and keeps
+- On start, the broker runs the resolved `guest_exec` followed by `penyero relay`, and keeps
   that process's stdin and stdout as the channel. Nothing listens on the host.
 - The channel process is started in a new session with no controlling terminal (`setsid`), and
   its stderr is captured rather than inherited. Otherwise, with a `guest_exec` like `sudo -u`, a
@@ -135,7 +135,7 @@ on this guest's channel *is* this guest.
 - The relay runs as whichever user `guest_exec` lands on, and clients must run as that same user
   to reach its socket. With `docker exec -i` that is the image's default user; a command that
   switches user (e.g. `-u 0`) would create a socket the guest's normal user cannot use.
-- The relay listens on `<home>/.priviledge/relay.sock` (directory mode 0700), where
+- The relay listens on `<home>/.penyero/relay.sock` (directory mode 0700), where
   `<home>` is the running user's home from the passwd database, not from the environment. The
   relay and the clients start in different environments (`guest_exec` runs no login shell; the
   agent's shell may export `XDG_STATE_HOME` or `XDG_RUNTIME_DIR`), so any path derived from
@@ -149,7 +149,7 @@ on this guest's channel *is* this guest.
 ## 4. Handshake and liveness
 
 - **Handshake.** The first line in each direction is a `hello` carrying the protocol version. The
-  guest's copy of priviledge is independent of the broker's (SPEC.md §3), so versions will drift;
+  guest's copy of penyero is independent of the broker's (SPEC.md §3), so versions will drift;
   on a mismatch the broker reports it in its pane and closes the channel, and the relay answers
   clients with an "incompatible broker" error until it exits.
 - **Heartbeat.** The broker sends a `ping` periodically (default every 10 s) and the relay answers
@@ -193,7 +193,7 @@ prompt's head/tail preview (10 lines each; a request is shown whole up to 20 lin
 spool, and `view` and `edit` first write a named copy, with the extension from `output_syntax`, into
 the same directory. An edited copy becomes the released result. Output stops at a per-request cap
 (default 64 MiB): the resource is stopped and the request becomes `failed` with the output written
-up to the cap. `retrieve` exits 1, and a `priviledge:` line on stderr says the cap was reached, the
+up to the cap. `retrieve` exits 1, and a `penyero:` line on stderr says the cap was reached, the
 output is partial, and the request should be narrowed. A resource's `timeout` (SPEC.md §8) ends the
 same way, the line saying it timed out. Memory stays flat whatever the result size, and waiting
 results cost disk, not RAM.
@@ -242,9 +242,9 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
 
 ## 8. Files
 
-- Everything lives under `~/.priviledge` on the privileged side (SPEC.md §8), with no override
+- Everything lives under `~/.penyero` on the privileged side (SPEC.md §8), with no override
   through the environment; tests set `HOME`.
-- Audit log: `~/.priviledge/log/<profile>/<name>.jsonl`, one JSON line per request step,
+- Audit log: `~/.penyero/log/<profile>/<name>.jsonl`, one JSON line per request step,
   each carrying the request id (SPEC.md §9). A directory per profile keeps names apart without
   restricting them: `a/b-c` and `a-b/c` would collide in a single flat name. `profile/name` is
   unique only while the guest exists
@@ -260,12 +260,12 @@ guests on the same network sniffing or spoofing it (network isolation or TLS). N
 - **Language: Python**, with a **pinned interpreter managed by uv**, so there is no dependency on
   the stock system Python and no version matrix to support. A self-contained executable that needs
   nothing installed (pex's scie output or PyInstaller embed the interpreter) is a packaging option
-  to evaluate when priviledge is distributed.
+  to evaluate when penyero is distributed.
 - Standard library only at runtime: `socket`, `selectors`, `subprocess`, `json`, `base64`,
   `argparse`, `tomllib`, `hashlib`, `tempfile`, `termios`, `pwd`, `secrets`. No
   third-party runtime dependencies. The inline prompt shows content escaped, not reformatted
   (SPEC.md §7); anything richer is the external pager or editor.
-- **Rust is a deliberate later option, not now.** priviledge's untrusted input is JSON over the
+- **Rust is a deliberate later option, not now.** penyero's untrusted input is JSON over the
   channel, mostly passed through to subprocesses; the security-critical logic is process and
   permission handling, not parsing. The stdlib `json` scanner (and `base64`'s) is C, the one
   native component exposed to guest bytes; it is mature and widely exercised. If that ever needs
