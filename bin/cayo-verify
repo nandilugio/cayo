@@ -1,18 +1,18 @@
 #!/bin/sh
-# ~/.aiws/bin/aiws-verify <profile> <name> [allowed-url]: check a guest against SETUP.md §15.
-# Run it as `aiws verify`, which selects the guest's VM.
+# ~/.cayo/bin/cayo-verify <profile> <name> [allowed-url]: check a guest against SETUP.md §15.
+# Run it as `cayo verify`, which selects the guest's VM.
 # The container's shape is checked from the host with docker inspect. The rest runs inside the
 # guest, from a script piped to its shell: the host only reads what it prints. allowed-url is a
 # URL the guest's allow-list should let through; without it, that check is skipped.
 # Exits 1 if any check fails. The checklist's manual items (file sharing, the proxy's log, a dev
 # server on the forwarded port, git push being refused) stay manual.
 set -u                             # not -e: a failing check is reported, not fatal
-[ $# -ge 2 ] || { echo "usage: aiws-verify <profile> <name> [allowed-url]" >&2; exit 64; }
+[ $# -ge 2 ] || { echo "usage: cayo-verify <profile> <name> [allowed-url]" >&2; exit 64; }
 profile=$1; name=$2; allowed=${3:-}
-guest="aiws-$profile-$name"
+guest="cayo-$profile-$name"
 fails=0
 host_address=192.168.5.2           # the host, as containers in colima's VMs reach it
-docker inspect "$guest" >/dev/null 2>&1 || { echo "aiws-verify: no container $guest" >&2; exit 1; }
+docker inspect "$guest" >/dev/null 2>&1 || { echo "cayo-verify: no container $guest" >&2; exit 1; }
 
 result() { if [ "$1" -eq 0 ]; then echo "ok    $2"; else echo "FAIL  $2"; fails=$((fails + 1)); fi; }
 inspect() { docker inspect -f "$1" "$guest"; }
@@ -24,8 +24,8 @@ inspect '{{json .HostConfig.SecurityOpt}}' | grep -q 'no-new-privileges:true'; r
 [ "$(inspect '{{.HostConfig.PidMode}}')" != host ]; result $? "own PID namespace"
 ! inspect '{{range .Mounts}}{{.Source}} {{end}}' | grep -q 'docker.sock'; result $? "no runtime socket mounted"
 mounts=$(inspect '{{range .Mounts}}{{.Destination}} {{end}}')
-expected="/home/aiws /home/aiws/exchange"
-case $profile in trusted|public) expected="$expected /home/aiws/.dotfiles" ;; esac
+expected="/home/cayo /home/cayo/exchange"
+case $profile in trusted|public) expected="$expected /home/cayo/.dotfiles" ;; esac
 [ "$(echo "$mounts" | tr ' ' '\n' | grep . | sort | tr '\n' ' ')" = \
   "$(echo "$expected" | tr ' ' '\n' | sort | tr '\n' ' ')" ]; result $? "mounts are exactly: $expected"
 networks=$(inspect '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}')
@@ -35,12 +35,12 @@ case $profile in
 esac
 case $profile in
   trusted|public)
-    [ "$(inspect '{{range .Mounts}}{{if eq .Destination "/home/aiws/.dotfiles"}}{{.RW}}{{end}}{{end}}')" = false ]
+    [ "$(inspect '{{range .Mounts}}{{if eq .Destination "/home/cayo/.dotfiles"}}{{.RW}}{{end}}{{end}}')" = false ]
     result $? "dotfiles mounted read-only" ;;
 esac
 
 # Everything else, from inside the guest.
-others=$(docker ps -a --format '{{.Names}}' | grep '^aiws-' | grep -v "^$guest" | tr '\n' ' ' || true)
+others=$(docker ps -a --format '{{.Names}}' | grep '^cayo-' | grep -v "^$guest" | tr '\n' ' ' || true)
 guest_checks() { cat <<'EOF'
 result() { if [ "$1" -eq 0 ]; then echo "ok    $2"; else echo "FAIL  $2"; fi; }
 quietly() { "$@" >/dev/null 2>&1; }
@@ -57,7 +57,7 @@ fi
 case $PROFILE in
   trusted|public)
     [ -n "$(ls -A ~/.dotfiles)" ]; result $? "dotfiles present (an empty mount means the VM lacks it)"
-    ! quietly touch ~/.dotfiles/.aiws-verify; result $? "dotfiles not writable"
+    ! quietly touch ~/.dotfiles/.cayo-verify; result $? "dotfiles not writable"
     [ -z "$(find / \( -path /proc -o -path /sys \) -prune -o -type s -print 2>/dev/null \
       | grep -v '/\.penyero/relay\.sock$')" ]; result $? "no Unix sockets besides the relay's"
     [ "$(connect_code https://example.com)" = 403 ]; result $? "the proxy refuses a host off the allow-list"

@@ -1,0 +1,11 @@
+#!/bin/sh
+# ~/.cayo/bin/cayo-window <profile> <name>: a tmux window for a guest (SETUP.md §7): the editor,
+# the agent, a shell, and the guest's approval pane. The pane runs under dtach, so another
+# window can attach to the same prompt (dtach -a <socket> -r winch).
+set -eu
+p=$1; n=$2; sock="$HOME/.cayo/run/$p-$n.serve"
+mkdir -p "${sock%/*}"
+tmux new-window -n "$p/$n" "cayo exec $p $n nvim"
+tmux split-window -h "cayo exec $p $n opencode"
+tmux split-window -v "cayo exec $p $n"
+tmux split-window -v "dtach -A $sock -r winch penyero serve $p $n"

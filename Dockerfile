@@ -1,5 +1,5 @@
-# ~/.aiws/Dockerfile: the base image of every guest (SETUP.md §6). Build it from the host, in
-# each VM: `aiws build`.
+# ~/.cayo/Dockerfile: the base image of every guest (SETUP.md §6). Build it from the host, in
+# each VM: `cayo build`.
 # Only what installs outside the home goes here: Docker copies the image's home into a guest's
 # home volume once, when the volume is created, so anything installed under it never updates.
 FROM debian:stable-slim
@@ -19,6 +19,6 @@ RUN arch=$(uname -m | sed 's/aarch64/arm64/') \
 
 # The penyero client and relay will be installed here too, system-wide, once they exist.
 
-RUN useradd -m -s /bin/zsh aiws && mkdir /home/aiws/src && chown aiws /home/aiws/src
-USER aiws
-WORKDIR /home/aiws
+RUN useradd -m -s /bin/zsh cayo && mkdir /home/cayo/src && chown cayo /home/cayo/src
+USER cayo
+WORKDIR /home/cayo
