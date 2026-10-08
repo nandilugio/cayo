@@ -59,7 +59,8 @@ The checkout holds the tool; `~/.cayo` holds yours. `examples/` has a template f
 ~/.cayo/
 ├── config              settings: a shell file of CAYO_* variables (examples/config)
 ├── guest-init          run once in each new guest (examples/guest-init)
-├── image/Dockerfile    your layer on top of the guest image (examples/image.Dockerfile)
+├── image/Dockerfile    your layer on the guest image, for every profile (examples/image.Dockerfile)
+├── image/<profile>/Dockerfile   one profile's own layer
 ├── egress/<guest>.txt  each guest's allow-list (examples/allow-list.txt)
 └── overrides/          compose overrides per project (examples/override.yml)
 ~/cayo-exchange/<vm>/<guest>/   exchange directories: guest-written, so kept out of ~/.cayo
@@ -67,7 +68,7 @@ The checkout holds the tool; `~/.cayo` holds yours. `examples/` has a template f
 
 - **`config`**: `CAYO_DOTFILES` (a directory mounted read-only into `trusted` and `public` guests; default `~/.cayo/dotfiles`; may be a link to your dotfiles checkout; when it doesn't exist, guests get none and `cayo new` says so), `CAYO_DOTFILES_MOUNT` (where guests see it; default `/home/cayo/.dotfiles`), `CAYO_VM_MOUNTS` (more host paths for the `cayo` VM, read-only, space-separated), any `CAYO_INIT_*` variables for `guest-init`, and `CAYO_NO_PROXY` (hosts a guest reaches directly: its HTTP dev services; per project, so usually in the environment of `cayo new`).
 - **`guest-init`**: `cayo new` pipes it into the new guest's shell, so it runs inside the guest as its user, with `CAYO_PROFILE`, `CAYO_NAME` and every `CAYO_INIT_*` variable (from `config` or the environment: `CAYO_INIT_GIT_EMAIL=you@example.com cayo new trusted shop`). Use it to link your dotfiles into place, set a git identity, install a shell framework. It never runs in hostile guests, which get nothing of yours, and `cayo recreate` doesn't run it again: the guest keeps its home.
-- **`image/Dockerfile`**: `FROM cayo-base`, plus whatever installs outside the home (system packages, a client like penyero's). When it exists, cayo builds it as `cayo-local` and new guests use it.
+- **`image/Dockerfile`** and **`image/<profile>/Dockerfile`**: your layers on the guest image (Image, below): the tools you want in every guest, and what one profile needs on top (or instead). Only what installs outside the home belongs in an image.
 - **What to keep private.** The allow-lists, the overrides and the guest names all name your projects and the hosts you trust, so keep them local (they are in `~/.cayo`, not in the checkout). The rest (`config`, `guest-init`, `image/`) can live in a public dotfiles repository, as long as it holds no secrets.
 
 ## Commands
@@ -77,7 +78,7 @@ cayo new    <profile> <name>                create the guest cayo-<profile>-<nam
 cayo rm     <profile> <name>                remove it, with its network, sidecars and home volume
 cayo recreate <profile> <name>              recreate it from the current images, keeping its
                                             home volume and forwarded ports
-cayo exec   <profile> <name> [cmd...]       run a command in it (default: a shell)
+cayo exec   <profile> <name> [cmd...]       run a command in it (default: a login shell)
 cayo port   <profile> <name> <port>[:<guest-port>]
                                             forward 127.0.0.1:<port> on the host to the guest
 cayo reload <profile> <name>                reload its proxy, after editing its allow-list
@@ -159,9 +160,17 @@ Start lists as empty as the work allows. A host that stores data for whoever aut
 
 ### Image
 
-`Dockerfile` builds `cayo-base`: Debian stable with shared tooling (git, curl, ripgrep, fd, zsh, a compiler toolchain, the Postgres client), a UTF-8 locale, a pinned nvim release and a non-root user, `cayo`. The build runs in the VM's Docker Engine, outside any guest and its proxy, so its downloads never need a guest's allow-list.
+Three layers, each built `FROM` the one below; a guest runs the most specific one that exists:
 
-Docker copies the image's home into a guest's volume only once, when the volume is created, so whatever installs under the home never updates from the image. Tools that install system-wide belong in the image (or your layer); tools that install into the home (editor plugins, language toolchains, the agent and its self-updater) are installed from inside the guest, through its proxy. There is no sudo in guests; installing system packages means rebuilding the image from the host.
+| Image | From | Holds |
+|---|---|---|
+| `cayo-base` | the checkout's `Dockerfile` | Debian stable, a non-root user `cayo` (shell: bash), and only what cayo needs: `ca-certificates` and `curl` (HTTPS through the proxy, `cayo verify`'s probes), `git` (the review flow fetches from the guest) |
+| `cayo-local` | `~/.cayo/image/Dockerfile` | your tools for every guest: a shell (and `usermod -s` to make it the one `cayo exec` opens), search tools, a toolchain, an editor (`examples/image.Dockerfile`) |
+| `cayo-<profile>` | `~/.cayo/image/<profile>/Dockerfile` | one profile's own, `FROM cayo-local`, or `FROM cayo-base` when it should carry none of your tools: a browser for `hostile-web`, say |
+
+`cayo build` builds all of them in each running VM, in the VM's Docker Engine, outside any guest and its proxy, so their downloads never need a guest's allow-list.
+
+Docker copies the image's home into a guest's volume only once, when the volume is created, so whatever installs under the home never updates from the image. Tools that install system-wide belong in a layer; tools that install into the home (editor plugins, language toolchains, the agent and its self-updater) are installed from inside the guest, through its proxy. There is no sudo in guests; installing system packages means rebuilding from the host.
 
 ### Terminal
 

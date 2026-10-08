@@ -4,7 +4,7 @@
 #   cayo rm     <profile> <name>                remove it, with its network, sidecars and home volume
 #   cayo recreate <profile> <name>              recreate it from the current images, keeping its
 #                                               home volume and forwarded ports
-#   cayo exec   <profile> <name> [cmd...]       run a command in it (default: a shell)
+#   cayo exec   <profile> <name> [cmd...]       run a command in it (default: a login shell)
 #   cayo port   <profile> <name> <port>[:<guest-port>]
 #                                               forward 127.0.0.1:<port> on the host to the guest
 #   cayo reload <profile> <name>                reload its proxy, after editing its allow-list
@@ -41,8 +41,13 @@ CAYO_NO_PROXY=${CAYO_NO_PROXY:-}            # hosts a new guest reaches directly
 # The dotfiles' real path, which is what the VM mounts and guests bind, or nothing.
 dotfiles_path() { (cd "$CAYO_DOTFILES" 2>/dev/null && pwd -P) || true; }
 
-# The guest image: the base, or the user's layer on top of it when ~/.cayo/image/Dockerfile exists.
-guest_image() { if [ -f "$user_dir/image/Dockerfile" ]; then echo cayo-local; else echo cayo-base; fi; }
+# The image a guest of a profile runs: the most specific of the user's layers that exists
+# (~/.cayo/image/<profile>/Dockerfile, then ~/.cayo/image/Dockerfile), else the base.
+guest_image() {
+  if [ -f "$user_dir/image/$1/Dockerfile" ]; then echo "cayo-$1"
+  elif [ -f "$user_dir/image/Dockerfile" ]; then echo cayo-local
+  else echo cayo-base; fi
+}
 
 # The VMs. This is their one definition: what each mounts from the host, read-only unless marked
 # :w, and nothing else. The proxies' configuration is copied into them (start_proxy), so no VM
@@ -64,16 +69,19 @@ vm_start() {
     # --activate=false: the machine's default Docker context stays what it was.
     colima start --profile "$vm" --activate=false "$@"
   fi
-  docker --context "colima-$vm" image inspect "$(guest_image)" >/dev/null 2>&1 || build_images "$vm"
+  docker --context "colima-$vm" image inspect cayo-base >/dev/null 2>&1 || build_images "$vm"
 }
 
-# The guest image, on a freshly pulled base, the user's layer if any, and the sidecars' images;
-# then drop the images the rebuild left unused. Guests keep the images they were created from
-# until `cayo recreate`. The base needs no build context: its Dockerfile is sent alone.
+# The guest images, on a freshly pulled base: the base, the user's layers if any, and the
+# sidecars' images; then drop the images the rebuild left unused. Guests keep the images they were
+# created from until `cayo recreate`. The base needs no build context: its Dockerfile is sent alone.
 build_images() {
-  echo "cayo: building the guest image in $1"
+  echo "cayo: building the guest images in $1"
   docker --context "colima-$1" build --pull -t cayo-base - < "$root/Dockerfile"
   [ ! -f "$user_dir/image/Dockerfile" ] || docker --context "colima-$1" build -t cayo-local "$user_dir/image"
+  for p in trusted public hostile-web hostile-sample; do
+    [ ! -f "$user_dir/image/$p/Dockerfile" ] || docker --context "colima-$1" build -t "cayo-$p" "$user_dir/image/$p"
+  done
   for image in ubuntu/squid alpine/socat; do docker --context "colima-$1" pull -q "$image" >/dev/null; done
   docker --context "colima-$1" image prune -f >/dev/null
 }
@@ -211,7 +219,7 @@ new_guest() {
   docker run -d --name "$guest" --hostname "$guest" --init \
     --cap-drop ALL --security-opt no-new-privileges:true \
     -e TERM=xterm-256color $network $mounts \
-    "$(guest_image)" sleep infinity >/dev/null
+    "$(guest_image "$profile")" sleep infinity >/dev/null
 }
 
 # ~/.cayo/guest-init, piped into a new guest's shell (the host only sends it), with CAYO_PROFILE,
@@ -266,8 +274,10 @@ recreate_guest() {
   for port in $ports; do forward_port "$port"; done
 }
 
+# Without a command: a login shell, the one the image records for the user (bash in the base; your
+# layer may change it).
 enter_guest() {
-  [ $# -gt 0 ] || set -- zsh
+  [ $# -gt 0 ] || set -- sh -c 'exec "$(getent passwd cayo | cut -d: -f7)" -l'
   exec docker exec -it -w /home/cayo/src "$guest" "$@"
 }
 
