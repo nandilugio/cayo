@@ -4,6 +4,8 @@
 #   cayo rm     <profile> <name>                remove it, with its network, sidecars and home volume
 #   cayo recreate <profile> <name>              recreate it from the current images, keeping its
 #                                               home volume and forwarded ports
+#   cayo stop   <profile> <name>                stop it, with its sidecars; start brings it back
+#   cayo start  <profile> <name>
 #   cayo exec   <profile> <name> [cmd...]       run a command in it (default: a login shell)
 #   cayo port   <profile> <name> <port>[:<guest-port>]
 #                                               forward 127.0.0.1:<port> on the host to the guest
@@ -19,7 +21,7 @@
 # a container shape: which VM it runs in, what is mounted, and how it reaches the network.
 set -eu
 
-usage() { sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 die() { echo "cayo: $*" >&2; exit 1; }
 vms="cayo cayo-hostile"
 
@@ -159,11 +161,15 @@ start_proxy() {
       echo "cayo: created $allow_list, empty: add hosts with cayo allow $profile $name <host>..."
     fi
   fi
-  docker create --name "$guest-proxy" --network bridge ubuntu/squid >/dev/null
+  docker create --name "$guest-proxy" --network bridge --restart unless-stopped ubuntu/squid >/dev/null
   copy_proxy_config
   docker start "$guest-proxy" >/dev/null
   docker network connect --alias "$guest-proxy" "$guest" "$guest-proxy"
-  # Squid takes a moment to listen, and the guest's first requests (guest-init's) must not race it.
+  wait_proxy
+}
+
+# Squid takes a moment to listen, and the guest's first requests (guest-init's) must not race it.
+wait_proxy() {
   tries=0
   until docker exec "$guest-proxy" bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' 2>/dev/null; do
     tries=$((tries + 1)); [ "$tries" -lt 50 ] || die "$guest-proxy didn't start listening"
@@ -227,8 +233,10 @@ new_guest() {
   fi
 
   # 4. The guest: no capabilities, no privilege escalation, idle until something execs into it.
+  # --restart unless-stopped, here and on the sidecars: a VM start brings them back, unless
+  # `cayo stop` stopped them.
   # shellcheck disable=SC2086 # $network and $mounts are lists of options
-  docker run -d --name "$guest" --hostname "$guest" --init \
+  docker run -d --name "$guest" --hostname "$guest" --init --restart unless-stopped \
     --cap-drop ALL --security-opt no-new-privileges:true \
     -e TERM=xterm-256color $network $mounts \
     "$(guest_image "$profile")" sleep infinity >/dev/null
@@ -257,16 +265,33 @@ forward_port() {
   host_port=${1%%:*}; guest_port=${1#*:}
   forwarder="$guest-port-$host_port"
   ! docker inspect "$forwarder" >/dev/null 2>&1 || die "port $host_port is already forwarded"
-  docker run -d --name "$forwarder" --network bridge -p "127.0.0.1:$host_port:$guest_port" \
+  docker run -d --name "$forwarder" --network bridge --restart unless-stopped \
+    -p "127.0.0.1:$host_port:$guest_port" \
     alpine/socat "TCP-LISTEN:$guest_port,fork,reuseaddr" "TCP:$guest:$guest_port" >/dev/null \
     || { docker rm -f "$forwarder" >/dev/null 2>&1; die "can't forward port $host_port"; }
   docker network connect "$guest" "$forwarder"
 }
 
+# The guest's containers, as docker lists them: itself, its proxy, its forwarders.
+guest_containers() {
+  docker ps -a --format '{{.Names}}' | grep -E "^$guest(-proxy|-port-[0-9]+)?\$"
+}
+
+stop_guest() {
+  docker inspect "$guest" >/dev/null 2>&1 || die "no guest $guest"
+  guest_containers | xargs docker stop >/dev/null
+}
+
+# The proxy first, listening before the guest is back; then the guest and its forwarders.
+start_guest() {
+  docker inspect "$guest" >/dev/null 2>&1 || die "no guest $guest"
+  if [ "$egress" != none ]; then docker start "$guest-proxy" >/dev/null; wait_proxy; fi
+  guest_containers | grep -v -- '-proxy$' | xargs docker start >/dev/null
+}
+
 # The guest's containers and network; its home volume stays.
 remove_containers() {
-  docker ps -a --format '{{.Names}}' | grep -E "^$guest(-proxy|-port-[0-9]+)?\$" \
-    | xargs docker rm -f -v >/dev/null 2>&1 || true  # -v: also the images' anonymous volumes
+  guest_containers | xargs docker rm -f -v >/dev/null 2>&1 || true  # -v: also anonymous volumes
   docker network rm "$guest" >/dev/null 2>&1 || true
 }
 
@@ -305,13 +330,15 @@ command=$1; shift
 case $command in
   vm)     vm_command "$@" ;;
   build)  build_command ;;
-  new|rm|recreate|exec|port|reload|denied|allow|verify)
+  new|rm|recreate|stop|start|exec|port|reload|denied|allow|verify)
     [ $# -ge 2 ] || usage
     guest_context "$1" "$2"; shift 2
     case $command in
       new)      new_guest; guest_init ;;
       rm)       remove_containers; docker volume rm "$home_volume" ;;
       recreate) recreate_guest ;;
+      stop)     stop_guest ;;
+      start)    start_guest ;;
       exec)     enter_guest "$@" ;;
       port)     forward_port "$@" ;;
       reload)   reload_proxy ;;

@@ -79,6 +79,8 @@ cayo new    <profile> <name>                create the guest cayo-<profile>-<nam
 cayo rm     <profile> <name>                remove it, with its network, sidecars and home volume
 cayo recreate <profile> <name>              recreate it from the current images, keeping its
                                             home volume and forwarded ports
+cayo stop   <profile> <name>                stop it, with its sidecars; start brings it back
+cayo start  <profile> <name>
 cayo exec   <profile> <name> [cmd...]       run a command in it (default: a login shell)
 cayo port   <profile> <name> <port>[:<guest-port>]
                                             forward 127.0.0.1:<port> on the host to the guest
@@ -118,12 +120,12 @@ host                                          colima VM cayo (trusted, public gu
 - **Why VMs of its own.** A general-purpose runtime's VM usually sees your whole home (Docker Desktop shares `/Users` by default), and restricting it is a machine-wide setting other tools depend on. cayo's VMs see exactly their mounts, at the same paths, and nothing else. With colima's defaults on macOS (the `vz` VM type, virtiofs mounts), **the host enforces read-only**: checked on colima 0.10.3 (Lima 2.2.1), root inside the VM could neither write to a read-only mount, nor after remounting it read-write, nor after mounting the share again by its tag.
 - **Your default Docker context stays yours.** `cayo vm start` passes `--activate=false`, which the VM's profile remembers; the commands select a VM explicitly (`docker --context colima-cayo`).
 - **Changing mounts**: edit `config`, then `cayo vm stop cayo` and `cayo vm start cayo`. A running VM keeps the mounts it started with.
-- **Lifecycle.** VMs don't start by themselves after a reboot: `cayo vm start <vm>`. A VM's configuration is in `~/.colima/<vm>/`, its Docker data (images, and every guest's home volume: repos, the agent's login) in a sparse disk under `~/.colima/_lima/_disks/`, the downloaded VM image in `~/Library/Caches/colima` (on macOS). `cayo vm stop` frees the VM's memory and keeps everything; `cayo vm delete` removes it after two confirmations, with `--data`: a plain `colima delete` keeps the data disk, and a VM created later with the same name gets it back, guests' volumes included. `cayo-hostile` is meant to be disposable: start it for a hostile task, delete it when its guests are gone.
+- **Lifecycle.** VMs don't start by themselves after a reboot: `cayo vm start <vm>`, which brings the guests in it back as they were, except the ones you stopped with `cayo stop` (Docker's `unless-stopped` policy). A VM's configuration is in `~/.colima/<vm>/`, its Docker data (images, and every guest's home volume: repos, the agent's login) in a sparse disk under `~/.colima/_lima/_disks/`, the downloaded VM image in `~/Library/Caches/colima` (on macOS). `cayo vm stop` frees the VM's memory and keeps everything; `cayo vm delete` removes it after two confirmations, with `--data`: a plain `colima delete` keeps the data disk, and a VM created later with the same name gets it back, guests' volumes included. `cayo-hostile` is meant to be disposable: start it for a hostile task, delete it when its guests are gone.
 - **Never** give a guest the runtime's control socket, `privileged: true`, host networking, or the host PID namespace: any of these hands it its VM, and everything the VM mounts.
 
 ### Guests
 
-`cayo new` picks the VM from the profile, creates the home volume and the exchange directory, for a guest with a network an internal network and its proxy, and runs the container with no capabilities, no privilege escalation, and nothing but `sleep` until something execs into it. Then it runs your `guest-init`.
+`cayo new` picks the VM from the profile, creates the home volume and the exchange directory, for a guest with a network an internal network and its proxy, and runs the container with no capabilities, no privilege escalation, and nothing but `sleep` until something execs into it. Then it runs your `guest-init`. A guest keeps running when you leave it; `cayo stop` stops it with its sidecars, `cayo start` brings them back, and nothing on disk changes either way.
 
 ```
 /home/cayo/                     the home volume: persists across container recreation
