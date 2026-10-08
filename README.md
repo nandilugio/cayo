@@ -47,7 +47,7 @@ ln -s ~/.local/share/cayo/bin/cayo ~/.local/bin/
 cayo vm start cayo
 ```
 
-`cayo new` creates what it needs under `~/.cayo` (a guest's allow-list starts empty, so its proxy refuses everything until you allow hosts); the rest of the configuration is optional.
+`cayo new` creates what it needs under `~/.cayo` (a guest's allow-list starts empty, so its proxy refuses everything until you allow hosts, unless `~/.cayo/egress/default.txt` gives new guests a starting list); the rest of the configuration is optional.
 
 Install from a checkout you trust and don't let guests write to: the host runs these scripts with your privileges. If you develop cayo itself inside a guest, install from a clean clone at a reviewed commit, never from the guest's working copy.
 
@@ -62,6 +62,7 @@ The checkout holds the tool; `~/.cayo` holds yours. `examples/` has a template f
 ├── image/Dockerfile    your layer on the guest image, for every profile (examples/image.Dockerfile)
 ├── image/<profile>/Dockerfile   one profile's own layer
 ├── egress/<guest>.txt  each guest's allow-list (examples/allow-list.txt)
+├── egress/default.txt  the hosts every new guest's list starts with, if you want any
 └── overrides/          compose overrides per project (examples/override.yml)
 ~/cayo-exchange/<vm>/<guest>/   exchange directories: guest-written, so kept out of ~/.cayo
 ```
@@ -148,7 +149,7 @@ host                                          colima VM cayo (trusted, public gu
 - Two modes: `allowlist` (`trusted`, `public`) allows only listed hostnames; `public` (`hostile-web`) allows any public address. `hostile-sample` has no network.
 - No TLS interception: the proxy sees hostnames, not contents.
 
-The proxy is Squid. cayo copies its configuration (`egress/` in the checkout) and the guest's allow-list (`~/.cayo/egress/cayo-<profile>-<name>.txt`: one hostname per line, a leading dot for subdomains too, `#` for comments) into it when it starts it, and again on `cayo reload`, so no VM mounts them and nothing in a guest or a VM can change them. A list may be empty: Squid warns about the empty ACL and refuses everything.
+The proxy is Squid. cayo copies its configuration (`egress/` in the checkout) and the guest's allow-list (`~/.cayo/egress/cayo-<profile>-<name>.txt`: one hostname per line, a leading dot for subdomains too, `#` for comments) into it when it starts it, and again on `cayo reload`, so no VM mounts them and nothing in a guest or a VM can change them. A new guest's list is a copy of `~/.cayo/egress/default.txt` if you keep one (the hosts your `guest-init` needs, say), or else empty: Squid warns about the empty ACL and refuses everything.
 
 Allowing a host, with the guest running:
 

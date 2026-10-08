@@ -147,16 +147,28 @@ copy_proxy_config() {
 
 start_proxy() {
   if [ "$egress" = allowlist ] && [ ! -f "$allow_list" ]; then
-    # A new list starts empty, from the commented template: the proxy refuses everything until
+    # A new list starts as a copy of ~/.cayo/egress/default.txt, the user's hosts for every new
+    # guest, or else of the commented template, empty: the proxy refuses everything until
     # `cayo allow` adds hosts.
     mkdir -p "$user_dir/egress"
-    cp "$root/examples/allow-list.txt" "$allow_list"
-    echo "cayo: created $allow_list, empty: add hosts with cayo allow $profile $name <host>..."
+    if [ -f "$user_dir/egress/default.txt" ]; then
+      cp "$user_dir/egress/default.txt" "$allow_list"
+      echo "cayo: created $allow_list from egress/default.txt"
+    else
+      cp "$root/examples/allow-list.txt" "$allow_list"
+      echo "cayo: created $allow_list, empty: add hosts with cayo allow $profile $name <host>..."
+    fi
   fi
   docker create --name "$guest-proxy" --network bridge ubuntu/squid >/dev/null
   copy_proxy_config
   docker start "$guest-proxy" >/dev/null
   docker network connect --alias "$guest-proxy" "$guest" "$guest-proxy"
+  # Squid takes a moment to listen, and the guest's first requests (guest-init's) must not race it.
+  tries=0
+  until docker exec "$guest-proxy" bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' 2>/dev/null; do
+    tries=$((tries + 1)); [ "$tries" -lt 50 ] || die "$guest-proxy didn't start listening"
+    sleep 0.2
+  done
 }
 
 reload_proxy() {

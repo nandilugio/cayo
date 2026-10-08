@@ -1,8 +1,9 @@
-# A guest's allow-list: copy to ~/.cayo/egress/cayo-<profile>-<name>.txt (README.md, Egress).
-# One hostname per line; a leading dot also matches subdomains (.example.com). Start as empty
-# as the work allows and add hosts as the proxy refuses them (`cayo denied`): `cayo allow` adds
-# and reloads; after editing by hand, `cayo reload`. Keep hosts that store data for any account
-# off it where possible (README.md, Egress): exact names, not whole domains.
+# A guest's allow-list, ~/.cayo/egress/cayo-<profile>-<name>.txt (README.md, Egress). `cayo new`
+# creates it from ~/.cayo/egress/default.txt, the hosts every new guest starts with, or from this
+# template, empty. One hostname per line; a leading dot also matches subdomains (.example.com).
+# Start as empty as the work allows and add hosts as the proxy refuses them (`cayo denied`):
+# `cayo allow` adds and reloads; after editing by hand, `cayo reload`. Keep hosts that store data
+# for any account off it where possible (README.md, Egress): exact names, not whole domains.
 #
 # For example, an agent's API, and git over HTTPS on GitHub:
 # api.anthropic.com
