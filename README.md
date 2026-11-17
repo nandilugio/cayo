@@ -76,7 +76,8 @@ The checkout holds the tool; `~/.cayo` holds yours. `examples/` has a template f
 
 ```
 cayo new    <profile> <name>                create the guest cayo-<profile>-<name>
-cayo rm     <profile> <name>                remove it, with its network, sidecars and home volume
+cayo rm     <profile> <name>                remove it, after asking: its network, sidecars,
+                                            home volume and allow-list
 cayo recreate <profile> <name>              recreate it from the current images, keeping its
                                             home volume and forwarded ports
 cayo stop   <profile> <name>                stop it, with its sidecars; start brings it back
@@ -88,13 +89,15 @@ cayo reload <profile> <name>                reload its proxy, after editing its 
 cayo denied <profile> <name>                the hosts its proxy refused, most frequent first
 cayo allow  <profile> <name> <host>...      add hosts to its allow-list, and reload
 cayo verify <profile> <name> [allowed-url]  check it against the checklist (Verification)
-cayo build                                  rebuild the guest image in each running VM, with
-                                            updated base and sidecar images
+cayo build                                  rebuild the guest and sidecar images in each
+                                            running VM, on an updated base
 cayo vm start|stop|delete <vm>              create or start a VM (cayo, cayo-hostile) with its
                                             mounts; stop it; delete it with all its data
 ```
 
 Guest names are letters, digits, `.` and `_`: no `-`, since cayo names a guest's network, volume and sidecars by appending to the container's name.
+
+`cayo rm` asks first: the home volume is the only copy of whatever in the guest was never fetched or pushed. The guest's allow-list goes with it, so a later guest of the same name starts from the default; its exchange directory is removed only if empty.
 
 ## How it works
 
@@ -138,8 +141,8 @@ host                                          colima VM cayo (trusted, public gu
 - **The dotfiles are read-only**, and a change on the host reaches every guest at once. They must never contain secrets, and file modes don't help: a guest reads every file in a mount, whatever its permissions. Hostile guests get none.
 - **The exchange directory** is the one writable host path, for screenshots, CSVs and similar, per guest under its VM's exchange root (the hostile VM can't see the others'). On the host, treat its contents like untrusted downloads: a guest can create symlinks there that point at host paths, and a host tool that follows one reads or overwrites the host file. Don't write into it over existing names, and check with `ls -l` before opening what's there.
 - **Proxy variables** are set in both spellings, since tools disagree on which they read (curl ignores an uppercase `HTTP_PROXY`). `CAYO_NO_PROXY`, at `cayo new`, adds the hosts the guest reaches directly: its HTTP dev services, which would otherwise be sent to the proxy and refused.
-- **Ports, when a guest needs them.** Docker publishes no ports for a container that is only on an internal network, so `cayo port` starts a small forwarder per port, on the bridge and attached to the guest's network: `cayo port trusted shop 8000` makes the guest's port 8000 reachable at `127.0.0.1:8000`, `cayo port trusted shop 18000:5173` maps another host port. A clash within a VM is refused; one between the two VMs, or with a host process, goes unnoticed, and the host port leads to whichever claimed it first. Dev servers must listen on `0.0.0.0` inside the guest (Django's, for one, defaults to `127.0.0.1`). Forwarded ports are reachable from other containers in the VM through the host, so they shouldn't expose anything that trusts its callers.
-- **Updating.** `cayo build` rebuilds on a freshly pulled Debian base (security updates come with every rebuild), rebuilds your layer, pulls the proxy and forwarder images and drops unused images. Guests keep the image they were created from until `cayo recreate`, which replaces the guest's containers, keeps its home volume and its forwarded ports, and ends whatever runs in the guest at that moment.
+- **Ports, when a guest needs them.** Docker publishes no ports for a container that is only on an internal network, so `cayo port` starts a small forwarder per port, on the bridge and attached to the guest's network: `cayo port trusted shop 8000` makes the guest's port 8000 reachable at `127.0.0.1:8000`, `cayo port trusted shop 18000:5173` maps another host port. The forwarder is socat, in the same image as the proxy (Egress). A clash within a VM is refused; one between the two VMs, or with a host process, goes unnoticed, and the host port leads to whichever claimed it first. Dev servers must listen on `0.0.0.0` inside the guest (Django's, for one, defaults to `127.0.0.1`). Forwarded ports are reachable from other containers in the VM through the host, so they shouldn't expose anything that trusts its callers.
+- **Updating.** `cayo build` rebuilds on a freshly pulled Debian base (security updates come with every rebuild): the guests' base, your layers and the sidecars' image, and drops unused images. Guests keep the image they were created from until `cayo recreate`, which replaces the guest's containers, keeps its home volume, its forwarded ports and the hosts it reaches directly (`CAYO_NO_PROXY`, unless you give it again), and ends whatever runs in the guest at that moment.
 
 ### Egress
 
@@ -147,11 +150,12 @@ host                                          colima VM cayo (trusted, public gu
 
 - The guest is on an `--internal` Docker network, which has no route out: non-HTTP TCP, UDP and external DNS have nowhere to go. The guest resolves only local names; the proxy resolves the rest, so DNS can't carry data out either (checked: a guest's lookup of a unique name produced no packet on any of the VM's interfaces).
 - A proxy sidecar is on that network and the bridge, and is the guest's only way out. Honouring the proxy variables is voluntary, but a process that ignores them has no route at all.
+- Sidecars pass on only what their program accepts. A container on two networks could also be used as a router by a neighbour that sends packets straight at it; sidecars run with packet forwarding off and without raw sockets, and `cayo verify` checks the first.
 - The proxy never connects to private, loopback or link-local addresses, which keeps the host, other containers and the local network out of reach, including through an allowed name that resolves to a private address.
 - Two modes: `allowlist` (`trusted`, `public`) allows only listed hostnames; `public` (`hostile-web`) allows any public address. `hostile-sample` has no network.
 - No TLS interception: the proxy sees hostnames, not contents.
 
-The proxy is Squid. cayo copies its configuration (`egress/` in the checkout) and the guest's allow-list (`~/.cayo/egress/cayo-<profile>-<name>.txt`: one hostname per line, a leading dot for subdomains too, `#` for comments) into it when it starts it, and again on `cayo reload`, so no VM mounts them and nothing in a guest or a VM can change them. A new guest's list is a copy of `~/.cayo/egress/default.txt` if you keep one (the hosts your `guest-init` needs, say), or else empty: Squid warns about the empty ACL and refuses everything.
+The proxy is Squid, from Debian's package: cayo builds the sidecars' image itself (`egress/Dockerfile`, Squid and socat on the same Debian base as the guests), so what sits between a guest and the network comes from the one source the guests already trust, not from a third party's image. cayo copies its configuration (`egress/` in the checkout) and the guest's allow-list (`~/.cayo/egress/cayo-<profile>-<name>.txt`: one hostname per line, a leading dot for subdomains too, `#` for comments) into it when it starts it, and again on `cayo reload`, so no VM mounts them and nothing in a guest or a VM can change them. A new guest's list is a copy of `~/.cayo/egress/default.txt` if you keep one (the hosts your `guest-init` needs, say), or else empty: Squid warns about the empty ACL and refuses everything.
 
 Allowing a host, with the guest running:
 
@@ -199,17 +203,21 @@ cd ~/src-clean/shop-app
 git remote add cayo 'ext::docker --context colima-cayo exec -i cayo-trusted-shop %S /home/cayo/src/shop-app'
 git config protocol.ext.allow user
 git config transfer.fsckObjects true
+git config remote.cayo.tagOpt --no-tags
 ```
 
 - `protocol.ext.allow user` allows `ext::` only for commands you run; git keeps it blocked for URLs coming from fetched content, such as submodules.
 - `git fetch cayo <branch>` runs `git-upload-pack` inside the guest. On the host, git only receives pack data, inert until checked out; `transfer.fsckObjects` makes it check every object before storing it.
+- `tagOpt --no-tags`: a fetch otherwise also stores the remote's tags, as tags of the clean clone. A guest could plant `v2.0` on a commit nobody reviewed, and git keeps a tag it already has when upstream's real one arrives later (checked on git 2.56). Branches don't have this problem: they land under `cayo/`.
+- If git-lfs is installed on the host with its filters enabled, a checkout contacts the URLs in the repo's `.lfsconfig`, which the guest wrote: read that file in review like any other, or check out with `GIT_LFS_SKIP_SMUDGE=1`.
 
 **Two-pass review.** First a comprehension pass in the guest, with your full editor: comfortable, but not authoritative, since the tooling there is agent-controlled (diff drivers, pagers and plugins can render something other than the commit). Then an authoritative pass in the clean clone, in a tool that doesn't run project code (`git log -p` with `delta` and `less`, Sublime Merge): quick, because the change is already understood.
 
 ```sh
 git fetch cayo feature-x
-git log -p origin/develop..cayo/feature-x
-git push origin cayo/feature-x:refs/heads/feature-x        # full ref: the source is a remote-tracking branch
+git log -p origin/develop..cayo/feature-x                  # note the commit you reviewed up to
+git push origin <reviewed-sha>:refs/heads/feature-x        # the commit, not the branch: a later
+                                                           #   fetch moves cayo/feature-x
 git worktree add ../shop-app-deploy <reviewed-sha>         # deploys run from here
 ```
 
@@ -217,7 +225,7 @@ Deploying runs guest-written code with your privileges; the guarantee is that wh
 
 ### Dev services and dev servers
 
-- Run each project's compose from its clean clone at a reviewed commit, so review covers its mounts, privileges and build contexts, in the guest's VM and on the guest's network only, with an override (`examples/override.yml`) that also drops published ports:
+- Run each project's compose from its clean clone at a reviewed commit, so review covers its mounts, privileges and build contexts, in the guest's VM and on the guest's network only, with an override (`examples/override.yml`) that also drops published ports and raw sockets:
 
   ```sh
   docker --context colima-cayo compose -f docker-compose.yml -f ~/.cayo/overrides/shop-app.yml up -d
@@ -241,7 +249,7 @@ Deploying runs guest-written code with your privileges; the guarantee is that wh
 
 | Profile | Checks |
 |---|---|
-| all | not privileged; all capabilities dropped; `no-new-privileges`; own PID namespace; no runtime socket mounted or present; exactly the expected mounts |
+| all | not privileged; all capabilities dropped; `no-new-privileges`; own PID namespace; no runtime socket mounted or present; exactly the expected mounts; its sidecars don't forward packets |
 | `trusted`, `public` | dotfiles (when mounted) present, read-only, not writable; the proxy refuses a host off the allow-list with its own 403; `allowed-url`, if given, gets through the proxy (whatever the site answers) |
 | `trusted`, `public`, `hostile-web` | only on its internal network; external names don't resolve; the proxy refuses the host and a private address; no route to the host or the internet around the proxy; other guests' containers don't resolve |
 | `hostile-web` | the public internet works through the proxy |

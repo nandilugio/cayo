@@ -38,9 +38,14 @@ if [ -n "$dotfiles" ]; then
   result $? "dotfiles mounted read-only"
 fi
 
+# Its sidecars are on a network with a route out: they must not pass packets on.
+for sidecar in $(docker ps --filter "label=cayo.guest=$guest" --format '{{.Names}}' | grep -vxF "$guest"); do
+  [ "$(docker exec "$sidecar" cat /proc/sys/net/ipv4/ip_forward)" = 0 ]; result $? "$sidecar doesn't forward packets"
+done
+
 # Everything else, from inside the guest.
-others=$(docker ps -a --format '{{.Names}}' | grep '^cayo-' \
-  | grep -v -E "^$guest(-proxy|-port-[0-9]+)?\$" | tr '\n' ' ' || true)  # not its own sidecars
+others=$(docker ps -a --filter label=cayo.guest --format '{{.Names}} {{.Label "cayo.guest"}}' \
+  | awk -v own="$guest" '$2 != own { printf "%s ", $1 }')                 # not its own sidecars
 guest_checks() { cat <<'EOF'
 result() { if [ "$1" -eq 0 ]; then echo "ok    $2"; else echo "FAIL  $2"; fi; }
 quietly() { "$@" >/dev/null 2>&1; }

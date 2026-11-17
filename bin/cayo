@@ -1,7 +1,8 @@
 #!/bin/sh
 # cayo: isolated environments for AI agents and other untrusted work (README.md).
 #   cayo new    <profile> <name>                create the guest cayo-<profile>-<name>
-#   cayo rm     <profile> <name>                remove it, with its network, sidecars and home volume
+#   cayo rm     <profile> <name>                remove it, after asking: its network, sidecars,
+#                                               home volume and allow-list
 #   cayo recreate <profile> <name>              recreate it from the current images, keeping its
 #                                               home volume and forwarded ports
 #   cayo stop   <profile> <name>                stop it, with its sidecars; start brings it back
@@ -13,19 +14,19 @@
 #   cayo denied <profile> <name>                the hosts its proxy refused, most frequent first
 #   cayo allow  <profile> <name> <host>...      add hosts to its allow-list, and reload
 #   cayo verify <profile> <name> [allowed-url]  check it against README.md's checklist
-#   cayo build                                  rebuild the guest image in each running VM, with
-#                                               updated base and sidecar images
+#   cayo build                                  rebuild the guest and sidecar images in each
+#                                               running VM, on an updated base
 #   cayo vm start|stop|delete <vm>              create or start a VM (cayo, cayo-hostile) with its
 #                                               mounts; stop it; delete it with all its data
 # Profiles are trust levels: trusted, public, hostile-web, hostile-sample (README.md). Each one is
 # a container shape: which VM it runs in, what is mounted, and how it reaches the network.
 set -eu
 
-usage() { sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 die() { echo "cayo: $*" >&2; exit 1; }
 vms="cayo cayo-hostile"
 
-# The checkout holds the tool (this script, cayo-verify, the base Dockerfile, the proxies'
+# The checkout holds the tool (this script, cayo-verify, the Dockerfiles, the proxies'
 # configuration); ~/.cayo holds the user's files: config, guest-init, image/, egress/ allow-lists.
 bin=$(dirname "$(readlink -f "$0")")
 root=$(cd "$bin/.." && pwd)
@@ -71,20 +72,21 @@ vm_start() {
     # --activate=false: the machine's default Docker context stays what it was.
     colima start --profile "$vm" --activate=false "$@"
   fi
-  docker --context "colima-$vm" image inspect cayo-base >/dev/null 2>&1 || build_images "$vm"
+  docker --context "colima-$vm" image inspect cayo-base cayo-sidecar >/dev/null 2>&1 || build_images "$vm"
 }
 
-# The guest images, on a freshly pulled base: the base, the user's layers if any, and the
-# sidecars' images; then drop the images the rebuild left unused. Guests keep the images they were
-# created from until `cayo recreate`. The base needs no build context: its Dockerfile is sent alone.
+# The images, on a freshly pulled Debian: the guests' base, the user's layers if any, and the
+# sidecars' (the proxy and the port forwarders); then drop the images the rebuild left unused.
+# Guests keep the images they were created from until `cayo recreate`. The base and the sidecar
+# need no build context: their Dockerfiles are sent alone.
 build_images() {
-  echo "cayo: building the guest images in $1"
+  echo "cayo: building the images in $1"
   docker --context "colima-$1" build --pull -t cayo-base - < "$root/Dockerfile"
+  docker --context "colima-$1" build --pull -t cayo-sidecar - < "$root/egress/Dockerfile"
   [ ! -f "$user_dir/image/Dockerfile" ] || docker --context "colima-$1" build -t cayo-local "$user_dir/image"
   for p in trusted public hostile-web hostile-sample; do
     [ ! -f "$user_dir/image/$p/Dockerfile" ] || docker --context "colima-$1" build -t "cayo-$p" "$user_dir/image/$p"
   done
-  for image in ubuntu/squid alpine/socat; do docker --context "colima-$1" pull -q "$image" >/dev/null; done
   docker --context "colima-$1" image prune -f >/dev/null
 }
 
@@ -134,9 +136,24 @@ guest_context() {
   allow_list="$user_dir/egress/$guest.txt"
 }
 
+# The images a guest needs, checked before anything is created or removed for it.
+require_images() {
+  for image in "$(guest_image "$profile")" cayo-sidecar; do
+    docker image inspect "$image" >/dev/null 2>&1 || die "no image $image in $vm; build it with: cayo build"
+  done
+}
+
 # Whether this guest gets the dotfiles: trusted and public guests, when there are any.
 guest_dotfiles() {
   case $profile in trusted|public) dotfiles_path ;; esac
+}
+
+# What every sidecar gets. The label is how a guest's containers are found (guest_containers).
+# They sit on the bridge, which has a route out, and on the guest's network: ip_forward off, so
+# they pass on only what their own program (Squid, socat) accepts, never a packet sent at them.
+sidecar_options() {
+  sidecar="--label cayo.guest=$guest --network bridge --restart unless-stopped --init \
+    --cap-drop NET_RAW --sysctl net.ipv4.ip_forward=0"
 }
 
 # The egress proxy: on the guest's internal network and on the bridge, the guest's only way out.
@@ -161,7 +178,11 @@ start_proxy() {
       echo "cayo: created $allow_list, empty: add hosts with cayo allow $profile $name <host>..."
     fi
   fi
-  docker create --name "$guest-proxy" --network bridge --restart unless-stopped ubuntu/squid >/dev/null
+  # shellcheck disable=SC2086 # $sidecar is a list of options
+  # The PID file of a Squid that was killed (a VM stopped under it) would keep the next one from
+  # starting: the container's files outlive its processes.
+  docker create --name "$guest-proxy" --label cayo.role=proxy $sidecar \
+    cayo-sidecar sh -c 'rm -f /run/squid.pid; exec squid -N' >/dev/null
   copy_proxy_config
   docker start "$guest-proxy" >/dev/null
   docker network connect --alias "$guest-proxy" "$guest" "$guest-proxy"
@@ -206,6 +227,7 @@ allow_hosts() {
 }
 
 new_guest() {
+  sidecar_options
   # 1. What the profile decides: the mounts, and the egress mode.
   mounts="-v $home_volume:/home/cayo -v $exchange_dir:/home/cayo/exchange"
   dotfiles=$(guest_dotfiles)
@@ -237,6 +259,7 @@ new_guest() {
   # `cayo stop` stopped them.
   # shellcheck disable=SC2086 # $network and $mounts are lists of options
   docker run -d --name "$guest" --hostname "$guest" --init --restart unless-stopped \
+    --label "cayo.guest=$guest" --label cayo.role=guest \
     --cap-drop ALL --security-opt no-new-privileges:true \
     -e TERM=xterm-256color $network $mounts \
     "$(guest_image "$profile")" sleep infinity >/dev/null
@@ -265,16 +288,19 @@ forward_port() {
   host_port=${1%%:*}; guest_port=${1#*:}
   forwarder="$guest-port-$host_port"
   ! docker inspect "$forwarder" >/dev/null 2>&1 || die "port $host_port is already forwarded"
-  docker run -d --name "$forwarder" --network bridge --restart unless-stopped \
+  sidecar_options
+  # shellcheck disable=SC2086 # $sidecar is a list of options
+  docker run -d --name "$forwarder" --label cayo.role=port $sidecar \
     -p "127.0.0.1:$host_port:$guest_port" \
-    alpine/socat "TCP-LISTEN:$guest_port,fork,reuseaddr" "TCP:$guest:$guest_port" >/dev/null \
+    cayo-sidecar socat "TCP-LISTEN:$guest_port,fork,reuseaddr" "TCP:$guest:$guest_port" >/dev/null \
     || { docker rm -f "$forwarder" >/dev/null 2>&1; die "can't forward port $host_port"; }
   docker network connect "$guest" "$forwarder"
 }
 
-# The guest's containers, as docker lists them: itself, its proxy, its forwarders.
+# The guest's containers: itself, its proxy, its forwarders. By label, not by name: a name is a
+# pattern to grep ('.' matches any character), and one guest's would match another's.
 guest_containers() {
-  docker ps -a --format '{{.Names}}' | grep -E "^$guest(-proxy|-port-[0-9]+)?\$"
+  docker ps -a --filter "label=cayo.guest=$guest" --format '{{.Names}}'
 }
 
 stop_guest() {
@@ -286,7 +312,7 @@ stop_guest() {
 start_guest() {
   docker inspect "$guest" >/dev/null 2>&1 || die "no guest $guest"
   if [ "$egress" != none ]; then docker start "$guest-proxy" >/dev/null; wait_proxy; fi
-  guest_containers | grep -v -- '-proxy$' | xargs docker start >/dev/null
+  guest_containers | grep -vxF "$guest-proxy" | xargs docker start >/dev/null
 }
 
 # The guest's containers and network; its home volume stays.
@@ -297,15 +323,43 @@ remove_containers() {
 
 # The forwarded ports, as <host-port>:<guest-port>, read from the forwarders themselves.
 forwarded_ports() {
-  docker ps -a --format '{{.Names}}' | grep -E "^$guest-port-[0-9]+\$" | while read -r forwarder; do
+  docker ps -a --filter "label=cayo.guest=$guest" --filter label=cayo.role=port \
+    --format '{{.Names}}' | while read -r forwarder; do
     docker inspect -f '{{range $p, $b := .HostConfig.PortBindings}}{{(index $b 0).HostPort}}:{{$p}}{{end}}' \
       "$forwarder" | sed 's#/tcp$##'
   done
 }
 
+# Removing a guest removes the only copy of whatever in its home was never fetched or pushed, so
+# it asks. Its allow-list goes with it: a later guest of the same name starts from the default.
+remove_guest() {
+  [ -n "$(guest_containers)" ] || docker volume inspect "$home_volume" >/dev/null 2>&1 \
+    || die "no guest $guest"
+  printf 'cayo: remove %s with its home volume (its repos, and any work not fetched or pushed)? [y/N] ' "$guest"
+  read -r answer || answer=
+  case $answer in y|Y) ;; *) die "not removed" ;; esac
+  remove_containers
+  ! docker volume inspect "$home_volume" >/dev/null 2>&1 || docker volume rm "$home_volume" >/dev/null
+  rm -f "$allow_list"
+  rmdir "$exchange_dir" 2>/dev/null || [ ! -d "$exchange_dir" ] \
+    || echo "cayo: kept $exchange_dir, which isn't empty"
+}
+
+# A new guest's name must be free: of a container, and of what a failed `cayo new` left behind.
+require_free() {
+  ! docker inspect "$guest" >/dev/null 2>&1 || die "$guest exists"
+  ! docker network inspect "$guest" >/dev/null 2>&1 \
+    || die "a network $guest is left from an earlier attempt; clear it with: cayo rm $profile $name"
+}
+
 recreate_guest() {
   docker inspect "$guest" >/dev/null 2>&1 || die "no guest $guest"
+  require_images
   ports=$(forwarded_ports)
+  # The hosts it reaches directly were given to `cayo new`; they are kept unless given again.
+  kept=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$guest" \
+    | sed -n 's/^no_proxy=localhost,127\.0\.0\.1,\{0,1\}//p')
+  CAYO_NO_PROXY=${CAYO_NO_PROXY:-$kept}
   remove_containers
   new_guest
   for port in $ports; do forward_port "$port"; done
@@ -315,7 +369,8 @@ recreate_guest() {
 # layer may change it).
 enter_guest() {
   [ $# -gt 0 ] || set -- sh -c 'exec "$(getent passwd cayo | cut -d: -f7)" -l'
-  exec docker exec -it -w /home/cayo/src "$guest" "$@"
+  if [ -t 0 ]; then tty=-it; else tty=-i; fi   # no terminal when piped to
+  exec docker exec "$tty" -w /home/cayo/src "$guest" "$@"
 }
 
 verify_guest() {
@@ -334,8 +389,8 @@ case $command in
     [ $# -ge 2 ] || usage
     guest_context "$1" "$2"; shift 2
     case $command in
-      new)      new_guest; guest_init ;;
-      rm)       remove_containers; docker volume rm "$home_volume" ;;
+      new)      require_free; require_images; new_guest; guest_init ;;
+      rm)       remove_guest ;;
       recreate) recreate_guest ;;
       stop)     stop_guest ;;
       start)    start_guest ;;
