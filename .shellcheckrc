@@ -1,0 +1,5 @@
+# Idioms these scripts use on purpose:
+# SC2016: Go templates and scripts for the guest are quoted so the host's shell leaves them alone.
+# SC2319: `[ ... ]; result $? "..."` reports a test's outcome.
+# SC1091: ~/.cayo/config is the user's file, not part of the checkout.
+disable=SC2016,SC2319,SC1091

@@ -1,0 +1,130 @@
+#!/bin/sh
+# test/run: exercise cayo against the running `cayo` VM (and `cayo-hostile`, if it runs too).
+# It creates guests named selftest.a and selftest_a (names one pattern would confuse), checks each
+# command on them, and removes them. It uses a configuration directory of its own (CAYO_DIR), so
+# your ~/.cayo, your image layers and your guests are not involved; host port 18731 must be free.
+# It needs the network: its allow-list holds example.org. Runs shellcheck first, if installed.
+set -u
+root=$(cd "$(dirname "$0")/.." && pwd)
+cayo="$root/bin/cayo"
+port=18731
+fails=0
+
+ok()   { echo "ok    $1"; }
+fail() { echo "FAIL  $1"; fails=$((fails + 1)); }
+# check <description> <command...>: passes if the command succeeds.
+check() { d=$1; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else fail "$d"; fi; }
+# is <description> <actual> <expected>
+is() { if [ "$2" = "$3" ]; then ok "$1"; else fail "$1 (got: $2)"; fi; }
+refuses() { d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else ok "$d"; fi; }
+in_vm() { docker --context "colima-$vm" "$@"; }
+names() { in_vm ps "$@" --format '{{.Names}}' | sort | tr '\n' ' '; }
+# What a guest's curl got from its proxy for an HTTPS URL: 200 passed, 403 refused.
+connect() { echo "curl -s -m 15 -o /dev/null -w '%{http_connect}' $2" | "$cayo" exec "$1" "$3" sh; }
+
+if command -v shellcheck >/dev/null; then
+  check "shellcheck" shellcheck "$cayo" "$root/bin/cayo-verify" "$0"
+else
+  echo "skip  shellcheck (not installed)"
+fi
+
+CAYO_DIR=$(mktemp -d); export CAYO_DIR
+mkdir -p "$CAYO_DIR/egress"
+echo example.org > "$CAYO_DIR/egress/default.txt"
+echo 'echo "$CAYO_PROFILE $CAYO_NAME $CAYO_INIT_WORD" > "$HOME/init-ran"' > "$CAYO_DIR/guest-init"
+cleanup() {
+  for g in "trusted selftest.a" "trusted selftest_a" "public selftest.a" \
+           "hostile-web selftest.a" "hostile-sample selftest.a"; do
+    # shellcheck disable=SC2086 # profile and name
+    echo y | "$cayo" rm $g >/dev/null 2>&1
+  done
+  rm -rf "$CAYO_DIR"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM
+
+vm=cayo
+in_vm info >/dev/null 2>&1 || { echo "test/run: VM cayo isn't running: cayo vm start cayo" >&2; exit 1; }
+a="cayo-trusted-selftest.a"; b="cayo-trusted-selftest_a"
+
+# ---- new -------------------------------------------------------------------------------------
+check "new: creates a guest" env CAYO_INIT_WORD=hello CAYO_NO_PROXY=app-search "$cayo" new trusted selftest.a
+is "new: the guest and its proxy carry its label" "$(names -a --filter "label=cayo.guest=$a")" "$a $a-proxy "
+check "new: the allow-list starts as default.txt" cmp -s "$CAYO_DIR/egress/default.txt" "$CAYO_DIR/egress/$a.txt"
+is "new: guest-init ran in the guest, with its variables" "$(echo 'cat ~/init-ran' | "$cayo" exec trusted selftest.a sh)" "trusted selftest.a hello"
+refuses "new: refuses a name that is taken" "$cayo" new trusted selftest.a
+check "new: a second guest, with a look-alike name" "$cayo" new trusted selftest_a
+
+# ---- verify, egress --------------------------------------------------------------------------
+check "verify: passes, an allowed URL included" "$cayo" verify trusted selftest.a https://example.org
+is "egress: a host off the list is refused" "$(connect trusted https://example.com selftest.a)" 403
+"$cayo" denied trusted selftest.a | grep -q 'example\.com'; check "denied: lists it" [ $? -eq 0 ]
+check "allow: adds a host" "$cayo" allow trusted selftest.a example.com
+is "allow: the proxy lets it through, reloaded" "$(connect trusted https://example.com selftest.a)" 200
+refuses "allow: refuses what isn't a hostname" "$cayo" allow trusted selftest.a 'a b'
+is "allow: the other guest's list is its own" "$(connect trusted https://example.com selftest_a)" 403
+
+# ---- port, exec ------------------------------------------------------------------------------
+check "port: forwards a host port" "$cayo" port trusted selftest.a "$port:8000"
+listen='$s=IO::Socket::INET->new(Listen=>5,LocalAddr=>"0.0.0.0",LocalPort=>8000,ReuseAddr=>1) or die;
+  while($c=$s->accept){print $c "HTTP/1.0 200 OK\r\n\r\nfrom-guest\n"; close $c}'
+serve() { in_vm exec -d "$a" perl -MIO::Socket::INET -e "$listen"; sleep 1; }
+serve
+is "port: the host reaches the guest's server" "$(curl -s -m 5 "http://127.0.0.1:$port/")" from-guest
+refuses "port: refuses a port already forwarded" "$cayo" port trusted selftest.a "$port:8000"
+is "exec: works without a terminal" "$(echo 'echo piped' | "$cayo" exec trusted selftest.a sh)" piped
+
+# ---- stop, start -----------------------------------------------------------------------------
+check "stop" "$cayo" stop trusted selftest.a
+is "stop: its containers are stopped" "$(names --filter "label=cayo.guest=$a")" ""
+is "stop: the look-alike guest still runs" "$(names --filter "label=cayo.guest=$b")" "$b $b-proxy "
+check "start" "$cayo" start trusted selftest.a
+is "start: all of them are back" "$(names --filter "label=cayo.guest=$a")" "$a $a-port-$port $a-proxy "
+is "start: the proxy works again" "$(connect trusted https://example.org selftest.a)" 200
+in_vm kill "$a-proxy" >/dev/null; in_vm start "$a-proxy" >/dev/null; sleep 3
+is "a killed proxy starts again (stale PID file)" "$(connect trusted https://example.org selftest.a)" 200
+
+# ---- recreate --------------------------------------------------------------------------------
+check "recreate" "$cayo" recreate trusted selftest.a
+is "recreate: keeps the home volume" "$(echo 'cat ~/init-ran' | "$cayo" exec trusted selftest.a sh)" "trusted selftest.a hello"
+in_vm inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$a" | grep -qx 'no_proxy=localhost,127.0.0.1,app-search'
+check "recreate: keeps the hosts reached directly" [ $? -eq 0 ]
+serve
+is "recreate: keeps the forwarded port" "$(curl -s -m 5 "http://127.0.0.1:$port/")" from-guest
+
+# ---- a missing image -------------------------------------------------------------------------
+if in_vm image inspect cayo-public >/dev/null 2>&1; then
+  echo "skip  new without its image (an image cayo-public exists)"
+else
+  mkdir -p "$CAYO_DIR/image/public"; echo 'FROM cayo-base' > "$CAYO_DIR/image/public/Dockerfile"
+  refuses "new: refuses when the profile's image isn't built" "$cayo" new public selftest.a
+  refuses "new: and leaves nothing behind" in_vm network inspect cayo-public-selftest.a
+  rm -r "$CAYO_DIR/image"
+fi
+
+# ---- rm --------------------------------------------------------------------------------------
+echo n | "$cayo" rm trusted selftest.a >/dev/null 2>&1
+check "rm: answered no, the guest stays" in_vm inspect "$a"
+echo y | "$cayo" rm trusted selftest.a >/dev/null 2>&1; check "rm: answered yes" [ $? -eq 0 ]
+is "rm: its containers are gone" "$(names -a --filter "label=cayo.guest=$a")" ""
+refuses "rm: its home volume is gone" in_vm volume inspect "$a-home"
+refuses "rm: its network is gone" in_vm network inspect "$a"
+refuses "rm: its allow-list is gone" [ -e "$CAYO_DIR/egress/$a.txt" ]
+refuses "rm: its empty exchange directory is gone" [ -e "$HOME/cayo-exchange/cayo/$a" ]
+is "rm: the look-alike guest is untouched" "$(names --filter "label=cayo.guest=$b")" "$b $b-proxy "
+refuses "rm: refuses a guest that doesn't exist" sh -c "echo y | '$cayo' rm trusted selftest.a"
+echo y | "$cayo" rm trusted selftest_a >/dev/null 2>&1
+
+# ---- hostile profiles, when their VM runs ----------------------------------------------------
+vm="cayo-hostile"
+if in_vm info >/dev/null 2>&1; then
+  check "hostile-web: new" env CAYO_INIT_WORD=secret "$cayo" new hostile-web selftest.a
+  refuses "hostile-web: guest-init never runs" in_vm exec cayo-hostile-web-selftest.a test -e /home/cayo/init-ran
+  check "hostile-web: verify passes" "$cayo" verify hostile-web selftest.a
+  check "hostile-sample: new" "$cayo" new hostile-sample selftest.a
+  check "hostile-sample: verify passes" "$cayo" verify hostile-sample selftest.a
+else
+  echo "skip  hostile profiles (VM cayo-hostile isn't running: cayo vm start cayo-hostile)"
+fi
+
+if [ "$fails" -eq 0 ]; then echo "all passed"; else echo "$fails failed"; exit 1; fi

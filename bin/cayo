@@ -30,7 +30,7 @@ vms="cayo cayo-hostile"
 # configuration); ~/.cayo holds the user's files: config, guest-init, image/, egress/ allow-lists.
 bin=$(dirname "$(readlink -f "$0")")
 root=$(cd "$bin/.." && pwd)
-user_dir="$HOME/.cayo"
+user_dir=${CAYO_DIR:-$HOME/.cayo}   # CAYO_DIR: another directory, as test/run uses
 
 # Settings, overridable in ~/.cayo/config, a shell file of these variables (README.md).
 CAYO_DOTFILES="$user_dir/dotfiles"          # mounted read-only into trusted and public guests

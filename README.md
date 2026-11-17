@@ -263,6 +263,10 @@ Checked on colima 0.10.3 for all three profile shapes across both VMs, including
 - Dev-service containers have no route out: `docker --context colima-cayo compose exec` into one and try an external address and `192.168.5.2`.
 - Loopback listeners on the host are known and acceptable.
 
+## Tests
+
+`test/run` exercises every guest command against the running `cayo` VM (and the hostile profiles, when `cayo-hostile` runs too): it creates guests named `selftest.a` and `selftest_a`, checks them and removes them, in about fifteen seconds. It uses a configuration directory of its own (`CAYO_DIR`, which stands in for `~/.cayo`), so your settings, image layers and guests aren't involved. It runs [shellcheck](https://www.shellcheck.net) first, if installed.
+
 ## Other platforms
 
 On a Linux host, colima runs its VMs with QEMU, which should keep this shape **(verify)**. Without a VM, containers share the host's kernel and a container escape is a host compromise; cayo doesn't support that.
